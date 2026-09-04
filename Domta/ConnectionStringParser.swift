@@ -7,7 +7,7 @@
 
 import Foundation
 
-enum ConnectionStringParser {
+nonisolated enum ConnectionStringParser {
     static func parse(_ rawValue: String) throws -> SQLConnectionConfiguration {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -35,6 +35,7 @@ enum ConnectionStringParser {
         let integratedSecurity = parseBool(firstMatch(in: values, keys: ["integrated security", "trusted_connection", "trusted connection"])) ?? false
         let trustServerCertificate = parseBool(firstMatch(in: values, keys: ["trustservercertificate", "trust server certificate"])) ?? false
         let encrypt = parseBool(firstMatch(in: values, keys: ["encrypt"]))
+        let authenticationMethod = firstMatch(in: values, keys: ["authentication"])
 
         return SQLConnectionConfiguration(
             server: server,
@@ -43,8 +44,46 @@ enum ConnectionStringParser {
             password: password,
             trustServerCertificate: trustServerCertificate,
             encrypt: encrypt,
-            isIntegratedSecurity: integratedSecurity
+            isIntegratedSecurity: integratedSecurity,
+            authenticationMethod: authenticationMethod
         )
+    }
+
+    /// parse แล้วตรวจว่า connection นี้ใช้กับ Domta ได้จริง — ใช้ร่วมกันทั้ง sqlcmd และ sqlpackage
+    ///
+    /// ไม่ตรวจว่า tool ตัวไหนติดตั้งอยู่ในเครื่อง ปล่อยให้แต่ละ service ตรวจของตัวเอง
+    static func validatedConfiguration(from input: ConnectionInput) throws -> SQLConnectionConfiguration {
+        let configuration = try parse(input.connectionString)
+            .applyingFallbackPassword(input.password)
+
+        if configuration.isIntegratedSecurity {
+            throw CompareAppError.integratedSecurityUnsupported
+        }
+
+        guard configuration.isSQLPasswordAuthentication else {
+            throw CompareAppError.unsupportedAuthenticationMethod(configuration.authenticationMethod ?? "")
+        }
+
+        guard configuration.username?.isEmpty == false else {
+            throw CompareAppError.missingUserID
+        }
+
+        guard configuration.password?.isEmpty == false else {
+            throw CompareAppError.missingPassword
+        }
+
+        if let password = configuration.password,
+           ["<password>", "password", "{password}"].contains(password.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
+            throw CompareAppError.placeholderPassword
+        }
+
+        return configuration
+    }
+
+    /// connection string มี `Password=` ที่ใช้งานได้จริงอยู่แล้วหรือยัง — ใช้ตัดสินว่าจะโชว์ช่อง password แยกไหม
+    static func hasInlinePassword(_ rawValue: String) -> Bool {
+        guard let configuration = try? parse(rawValue) else { return false }
+        return configuration.password?.isEmpty == false
     }
 
     private static func firstMatch(in values: [String: String], keys: [String]) -> String? {

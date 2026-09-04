@@ -12,6 +12,8 @@ private enum AppRoute: Hashable {
     case tables
     case results
     case script
+    case schemaCompare
+    case schemaScript
 }
 
 private struct ComparePreviewSelection: Equatable {
@@ -84,10 +86,12 @@ private struct ComparePreviewRowView: View, Equatable {
 
 struct ContentView: View {
     @StateObject private var viewModel = CompareViewModel()
+    @StateObject private var schemaViewModel = SchemaCompareViewModel()
     @State private var path: [AppRoute] = []
     @State private var previewSelection: ComparePreviewSelection?
     @State private var compareSplitRatio: CGFloat = 0.42
     @State private var compareSplitDragStartTopHeight: CGFloat?
+    @State private var tableSearchText: String = ""
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -100,6 +104,19 @@ struct ContentView: View {
                         resultsPage
                     case .script:
                         scriptPage
+                    case .schemaCompare:
+                        SchemaCompareView(
+                            viewModel: schemaViewModel,
+                            source: viewModel.sourceInput,
+                            target: viewModel.targetInput,
+                            onEditConnections: { path.removeAll() },
+                            onShowScript: {
+                                schemaViewModel.prepareScript()
+                                path.append(.schemaScript)
+                            }
+                        )
+                    case .schemaScript:
+                        SchemaScriptView(viewModel: schemaViewModel)
                     }
                 }
         }
@@ -182,17 +199,23 @@ struct ContentView: View {
                 Spacer(minLength: 20)
 
                 VStack(alignment: .leading, spacing: 10) {
-                    headerStat(title: "Workflow", value: "Load > Compare > Sync")
+                    headerStat(title: "Workflow", value: viewModel.compareMode.workflowSummary)
                     headerStat(title: "Supported", value: "SQL Server / Azure SQL")
-                    headerStat(title: "Auth", value: "SQL Authentication")
+                    headerStat(title: "Requires", value: viewModel.compareMode.requiredTool)
                 }
                 .frame(width: 260, alignment: .leading)
             }
 
             HStack(spacing: 12) {
-                headerBadge("ต้องมี `sqlcmd` อยู่ในเครื่อง", systemImage: "terminal")
+                headerBadge(
+                    viewModel.compareMode == .data ? "ต้องมี `sqlcmd` อยู่ในเครื่อง" : "ต้องมี `sqlcmd` และ `sqlpackage` อยู่ในเครื่อง",
+                    systemImage: "terminal"
+                )
                 headerBadge("รองรับ SQL authentication จาก connection string", systemImage: "key.horizontal")
-                headerBadge("เหมาะกับการตรวจ diff ก่อน sync", systemImage: "arrow.trianglehead.branch")
+                headerBadge(
+                    viewModel.compareMode == .data ? "เหมาะกับการตรวจ diff ก่อน sync" : "เทียบ table / view / stored procedure",
+                    systemImage: "arrow.trianglehead.branch"
+                )
             }
         }
         .padding(24)
@@ -281,12 +304,16 @@ struct ContentView: View {
     }
 
     private var connectionEditorsSection: some View {
-        sectionCard(title: "Connections", subtitle: "วาง source และ target connection string แล้วเริ่มโหลดตารางที่เทียบกันได้") {
+        sectionCard(title: "Connections", subtitle: "วาง source และ target connection string แล้วเลือกโหมดที่ต้องการเทียบ") {
             VStack(spacing: 16) {
+                modePicker
+
                 HStack(alignment: .top, spacing: 16) {
                     connectionEditor(
                         title: "Source",
                         text: $viewModel.sourceConnectionString,
+                        password: $viewModel.sourcePassword,
+                        needsManualPassword: viewModel.sourceNeedsManualPassword,
                         prompt: "Data Source=your-server-name.database.windows.net,1433;Database=your-database-name;User ID=your-username;Password=your-password;Encrypt=True;Trust Server Certificate=True;",
                         isTesting: viewModel.isTestingSourceConnection,
                         testAction: viewModel.testSourceConnection,
@@ -296,6 +323,8 @@ struct ContentView: View {
                     connectionEditor(
                         title: "Target",
                         text: $viewModel.targetConnectionString,
+                        password: $viewModel.targetPassword,
+                        needsManualPassword: viewModel.targetNeedsManualPassword,
                         prompt: "Data Source=your-server-name.database.windows.net,1433;Database=your-database-name;User ID=your-username;Password=your-password;Encrypt=True;Trust Server Certificate=True;",
                         isTesting: viewModel.isTestingTargetConnection,
                         testAction: viewModel.testTargetConnection,
@@ -304,17 +333,35 @@ struct ContentView: View {
                 }
 
                 HStack {
-                    Button(viewModel.isBusy && viewModel.activeOperationTitle == "Loading Comparable Tables" ? "Loading..." : "Load Comparable Tables") {
-                        viewModel.resetTableSelectionState()
-                        path.append(.tables)
-                        viewModel.loadComparableTables()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(viewModel.isBusy)
+                    switch viewModel.compareMode {
+                    case .data:
+                        Button(viewModel.isBusy && viewModel.activeOperationTitle == "Loading Comparable Tables" ? "Loading..." : "Load Comparable Tables") {
+                            viewModel.resetTableSelectionState()
+                            path.append(.tables)
+                            viewModel.loadComparableTables()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(viewModel.isBusy)
 
-                    Text("เริ่มจากตรวจ connection แล้วค่อยโหลด comparable tables")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        Text("เริ่มจากตรวจ connection แล้วค่อยโหลด comparable tables")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                    case .schema:
+                        Button("Open Schema Compare") {
+                            viewModel.rememberCurrentConnectionPair()
+                            schemaViewModel.clearReport()
+                            path.append(.schemaCompare)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(viewModel.isBusy || !schemaViewModel.isSqlPackageAvailable)
+
+                        Text(schemaViewModel.isSqlPackageAvailable
+                             ? "เทียบโครงสร้างทั้งสองฝั่ง แล้วติ๊กเลือก table / view / stored procedure ที่สนใจในตารางผลลัพธ์"
+                             : "ไม่พบ `sqlpackage` — ติดตั้งด้วย `dotnet tool install --global microsoft.sqlpackage`")
+                            .font(.caption)
+                            .foregroundStyle(schemaViewModel.isSqlPackageAvailable ? Color.secondary : Color.orange)
+                    }
 
                     Spacer()
                 }
@@ -322,9 +369,30 @@ struct ContentView: View {
         }
     }
 
+    private var modePicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("Mode", selection: $viewModel.compareMode) {
+                ForEach(CompareMode.allCases) { mode in
+                    Label(mode.title, systemImage: mode.systemImage)
+                        .tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(viewModel.isBusy)
+
+            Text(viewModel.compareMode.subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
     private func connectionEditor(
         title: String,
         text: Binding<String>,
+        password: Binding<String>,
+        needsManualPassword: Bool,
         prompt: String,
         isTesting: Bool,
         testAction: @escaping () -> Void,
@@ -378,6 +446,27 @@ struct ContentView: View {
                             .allowsHitTesting(false)
                     }
                 }
+
+            if needsManualPassword {
+                VStack(alignment: .leading, spacing: 6) {
+                    SecureField("Password", text: password)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                        .background {
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(Color(nsColor: .textBackgroundColor))
+                        }
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                        }
+
+                    Text("connection string นี้ไม่มี `Password=` — ใส่รหัสผ่านที่นี่ (เก็บไว้ระหว่างเปิดแอปเท่านั้น ไม่ถูกบันทึกลงดิสก์)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
 
             if let testMessage, !testMessage.isEmpty {
                 Text(testMessage)
@@ -480,6 +569,17 @@ struct ContentView: View {
         .shadow(color: Color.black.opacity(0.04), radius: 16, x: 0, y: 8)
     }
 
+    private var filteredComparableTables: [ComparableTable] {
+        let query = tableSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return viewModel.comparableTables }
+
+        return viewModel.comparableTables.filter { table in
+            table.schema.tableName.localizedCaseInsensitiveContains(query)
+                || table.schema.schemaName.localizedCaseInsensitiveContains(query)
+                || table.displayName.localizedCaseInsensitiveContains(query)
+        }
+    }
+
     private var tablesPage: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -535,6 +635,34 @@ struct ContentView: View {
                             Spacer()
                         }
 
+                        HStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
+                                .foregroundStyle(.secondary)
+
+                            TextField("ค้นหาชื่อ table หรือ schema", text: $tableSearchText)
+                                .textFieldStyle(.plain)
+
+                            if !tableSearchText.isEmpty {
+                                Button {
+                                    tableSearchText = ""
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background {
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.7))
+                        }
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                        }
+
                         if viewModel.comparableTables.isEmpty {
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(viewModel.isBusy ? "กำลังโหลด comparable tables..." : "ยังไม่มีตารางที่พร้อม compare")
@@ -549,10 +677,24 @@ struct ContentView: View {
                                 RoundedRectangle(cornerRadius: 18)
                                     .fill(Color(nsColor: .windowBackgroundColor).opacity(0.7))
                             }
+                        } else if filteredComparableTables.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("ไม่พบตารางที่ตรงกับคำค้นหา")
+                                    .font(.headline)
+                                Text("ลองค้นหาด้วยชื่อ table หรือ schema อื่น")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(18)
+                            .background {
+                                RoundedRectangle(cornerRadius: 18)
+                                    .fill(Color(nsColor: .windowBackgroundColor).opacity(0.7))
+                            }
                         } else {
                             ScrollView {
                                 LazyVStack(spacing: 12) {
-                                    ForEach(viewModel.comparableTables) { table in
+                                    ForEach(filteredComparableTables) { table in
                                         tableRow(table)
                                     }
                                 }

@@ -13,8 +13,11 @@ import Foundation
 final class CompareViewModel: ObservableObject {
     private static let recentConnectionsKey = "domta.recent.connection.pairs"
 
+    @Published var compareMode: CompareMode = .data
     @Published var sourceConnectionString: String = ""
     @Published var targetConnectionString: String = ""
+    @Published var sourcePassword: String = ""
+    @Published var targetPassword: String = ""
     @Published var recentConnectionPairs: [RecentConnectionPair] = []
     @Published var comparableTables: [ComparableTable] = []
     @Published var selectedTableKeys: Set<String> = []
@@ -37,9 +40,36 @@ final class CompareViewModel: ObservableObject {
         loadRecentConnections()
     }
 
+    /// connection string ยังไม่มี `Password=` ที่ใช้ได้ → ต้องให้ผู้ใช้กรอกรหัสผ่านแยก
+    var sourceNeedsManualPassword: Bool {
+        needsManualPassword(for: sourceConnectionString)
+    }
+
+    var targetNeedsManualPassword: Bool {
+        needsManualPassword(for: targetConnectionString)
+    }
+
+    private func needsManualPassword(for connectionString: String) -> Bool {
+        !connectionString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !ConnectionStringParser.hasInlinePassword(connectionString)
+    }
+
+    var sourceInput: ConnectionInput {
+        ConnectionInput(connectionString: sourceConnectionString, password: sourcePassword)
+    }
+
+    var targetInput: ConnectionInput {
+        ConnectionInput(connectionString: targetConnectionString, password: targetPassword)
+    }
+
+    /// เก็บคู่ connection ปัจจุบันลง recent list — โหมด schema compare เรียกใช้ก่อนเริ่มงาน
+    func rememberCurrentConnectionPair() {
+        saveCurrentConnectionPair()
+    }
+
     func loadComparableTables(onSuccess: (() -> Void)? = nil) {
-        let source = sourceConnectionString
-        let target = targetConnectionString
+        let source = sourceInput
+        let target = targetInput
         let service = self.service
 
         saveCurrentConnectionPair()
@@ -109,8 +139,8 @@ final class CompareViewModel: ObservableObject {
         let selectedSchemas = comparableTables
             .filter { selectedTableKeys.contains($0.id) }
             .map(\.schema)
-        let source = sourceConnectionString
-        let target = targetConnectionString
+        let source = sourceInput
+        let target = targetInput
         let service = self.service
 
         guard !selectedSchemas.isEmpty else { return }
@@ -200,7 +230,7 @@ final class CompareViewModel: ObservableObject {
 
     func testSourceConnection() {
         testConnection(
-            sourceConnectionString,
+            sourceInput,
             label: "Source",
             setTesting: { [weak self] isTesting in
                 self?.isTestingSourceConnection = isTesting
@@ -212,7 +242,7 @@ final class CompareViewModel: ObservableObject {
 
     func testTargetConnection() {
         testConnection(
-            targetConnectionString,
+            targetInput,
             label: "Target",
             setTesting: { [weak self] isTesting in
                 self?.isTestingTargetConnection = isTesting
@@ -223,7 +253,7 @@ final class CompareViewModel: ObservableObject {
     }
 
     private func testConnection(
-        _ connectionString: String,
+        _ input: ConnectionInput,
         label: String,
         setTesting: @escaping @MainActor (Bool) -> Void,
         assign: @escaping @MainActor (String) -> Void
@@ -245,7 +275,7 @@ final class CompareViewModel: ObservableObject {
 
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
-                    try service.testConnection(connectionString, label: label)
+                    try service.testConnection(input, label: label)
                 }.value
 
                 await assign(result.details)

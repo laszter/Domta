@@ -7,7 +7,21 @@
 
 import Foundation
 
-struct SQLConnectionConfiguration {
+/// connection string หนึ่งฝั่ง พร้อมรหัสผ่านที่ผู้ใช้กรอกแยกไว้
+///
+/// tool อย่าง vscode-mssql export connection string ออกมาโดยเว้น `Password=` ว่าง
+/// เพราะเก็บรหัสผ่านไว้ใน Keychain ของ OS แทน — ช่อง password แยกเลยจำเป็น
+struct ConnectionInput: Sendable {
+    let connectionString: String
+    let password: String
+
+    init(connectionString: String, password: String = "") {
+        self.connectionString = connectionString
+        self.password = password
+    }
+}
+
+nonisolated struct SQLConnectionConfiguration {
     let server: String
     let database: String?
     let username: String?
@@ -15,6 +29,54 @@ struct SQLConnectionConfiguration {
     let trustServerCertificate: Bool
     let encrypt: Bool?
     let isIntegratedSecurity: Bool
+    let authenticationMethod: String?
+
+    /// `Authentication=` ที่ตัดช่องว่างและ case ออกแล้ว เช่น `SqlPassword` -> `sqlpassword`
+    var normalizedAuthenticationMethod: String? {
+        guard let authenticationMethod else { return nil }
+
+        let normalized = authenticationMethod
+            .lowercased()
+            .components(separatedBy: .whitespacesAndNewlines)
+            .joined()
+
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    /// ไม่ระบุ `Authentication=` ให้ถือว่าเป็น SQL login ตามค่า default ของ SqlClient
+    var isSQLPasswordAuthentication: Bool {
+        guard let method = normalizedAuthenticationMethod else { return true }
+        return method == "sqlpassword" || method == "sql"
+    }
+
+    /// server ที่ชี้มาที่เครื่องตัวเอง (docker ที่ map port ออกมา) — ใช้แยกข้อความ diagnosis
+    var isLocalServer: Bool {
+        let host = server
+            .replacingOccurrences(of: "tcp:", with: "", options: [.caseInsensitive, .anchored])
+            .split(separator: ",").first
+            .map { $0.split(separator: "\\").first.map(String.init) ?? String($0) }?
+            .trimmingCharacters(in: .whitespaces)
+            .lowercased() ?? ""
+
+        return ["localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal"].contains(host)
+    }
+
+    /// เติมรหัสผ่านที่ผู้ใช้กรอกแยก เมื่อ connection string ไม่มี `Password=` หรือมีแต่ว่าง
+    func applyingFallbackPassword(_ fallback: String) -> SQLConnectionConfiguration {
+        guard password?.isEmpty != false else { return self }
+        guard !fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return self }
+
+        return SQLConnectionConfiguration(
+            server: server,
+            database: database,
+            username: username,
+            password: fallback,
+            trustServerCertificate: trustServerCertificate,
+            encrypt: encrypt,
+            isIntegratedSecurity: isIntegratedSecurity,
+            authenticationMethod: authenticationMethod
+        )
+    }
 }
 
 struct MetadataRow: Decodable {
@@ -311,7 +373,7 @@ struct RecentConnectionPair: Identifiable, Codable, Hashable {
     }
 }
 
-struct ProgressState {
+nonisolated struct ProgressState {
     let message: String
     let completedUnitCount: Int
     let totalUnitCount: Int
@@ -325,8 +387,14 @@ struct ProgressState {
 
 enum CompareAppError: LocalizedError {
     case invalidConnectionString(String)
-    case unsupportedAuthentication
+    case missingUserID
+    case missingPassword
+    case integratedSecurityUnsupported
+    case unsupportedAuthenticationMethod(String)
     case sqlcmdNotFound
+    case sqlPackageNotFound
+    case sqlPackageFailed(String)
+    case operationCancelled
     case placeholderPassword
     case queryFailed(String)
     case invalidJSON(String)
@@ -335,10 +403,34 @@ enum CompareAppError: LocalizedError {
         switch self {
         case .invalidConnectionString(let message):
             return "Connection string ไม่ถูกต้อง: \(message)"
-        case .unsupportedAuthentication:
-            return "ตอนนี้รองรับเฉพาะ SQL authentication ที่มี User ID และ Password ใน connection string"
+        case .missingUserID:
+            return "Connection string ไม่มี `User ID` — Domta รองรับเฉพาะ SQL login"
+        case .missingPassword:
+            return """
+            ยังไม่มีรหัสผ่านสำหรับ connection นี้
+
+            ใส่รหัสผ่านในช่อง Password ใต้ connection string หรือเติม `Password=...` ลงใน connection string โดยตรง
+            (vscode-mssql จะ export connection string โดยเว้น `Password=` ว่างเสมอ เพราะเก็บรหัสผ่านไว้ใน Keychain)
+            """
+        case .integratedSecurityUnsupported:
+            return "`Integrated Security` / `Trusted_Connection` ใช้บน macOS ไม่ได้ — ต้องใช้ SQL login (User ID + Password)"
+        case .unsupportedAuthenticationMethod(let method):
+            return "`Authentication=\(method)` ยังไม่รองรับ — ตอนนี้รองรับเฉพาะ SQL login (`SqlPassword`)"
         case .sqlcmdNotFound:
             return "ไม่พบ `sqlcmd` ในเครื่อง กรุณาติดตั้ง Microsoft sqlcmd ก่อนใช้งาน"
+        case .sqlPackageNotFound:
+            return """
+            ไม่พบ `sqlpackage` ในเครื่อง — โหมด Schema Compare ต้องใช้ sqlpackage
+
+            ติดตั้งด้วย .NET SDK:
+                dotnet tool install --global microsoft.sqlpackage
+
+            แล้วตรวจว่า `~/.dotnet/tools` อยู่ใน PATH หรือวางไบนารีไว้ที่ /usr/local/bin/sqlpackage
+            """
+        case .sqlPackageFailed(let message):
+            return "sqlpackage ทำงานไม่สำเร็จ: \(message)"
+        case .operationCancelled:
+            return "ยกเลิกการทำงานแล้ว"
         case .placeholderPassword:
             return "กรุณาใส่รหัสผ่านจริง ไม่ใช่ค่า placeholder เช่น `<password>`"
         case .queryFailed(let message):

@@ -8,8 +8,8 @@
 import Foundation
 
 struct SQLCmdService: Sendable {
-    nonisolated func testConnection(_ connectionString: String, label: String) throws -> ConnectionTestResult {
-        let configuration = try validatedConfiguration(from: connectionString)
+    nonisolated func testConnection(_ input: ConnectionInput, label: String) throws -> ConnectionTestResult {
+        let configuration = try validatedConfiguration(from: input)
         let rows = try runDelimitedQuery(
             """
             SET NOCOUNT ON;
@@ -36,8 +36,8 @@ struct SQLCmdService: Sendable {
     }
 
     nonisolated func loadSchemas(
-        source: String,
-        target: String,
+        source: ConnectionInput,
+        target: ConnectionInput,
         progress: (@Sendable (ProgressState) -> Void)? = nil
     ) throws -> [ComparableTable] {
         let sourceConfig = try validatedConfiguration(from: source)
@@ -82,8 +82,8 @@ struct SQLCmdService: Sendable {
     }
 
     nonisolated func compareTables(
-        source: String,
-        target: String,
+        source: ConnectionInput,
+        target: ConnectionInput,
         schemas: [TableSchema],
         progress: (@Sendable (ProgressState) -> Void)? = nil
     ) throws -> (results: [TableCompareResult], script: String) {
@@ -119,21 +119,8 @@ struct SQLCmdService: Sendable {
         return (results.sorted { $0.tableName < $1.tableName }, ScriptGenerator.wrapScriptBody(script))
     }
 
-    private nonisolated func validatedConfiguration(from connectionString: String) throws -> SQLConnectionConfiguration {
-        let configuration = try ConnectionStringParser.parse(connectionString)
-
-        if configuration.isIntegratedSecurity {
-            throw CompareAppError.unsupportedAuthentication
-        }
-
-        guard configuration.username?.isEmpty == false, configuration.password?.isEmpty == false else {
-            throw CompareAppError.unsupportedAuthentication
-        }
-
-        if let password = configuration.password,
-           ["<password>", "password", "{password}"].contains(password.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
-            throw CompareAppError.placeholderPassword
-        }
+    private nonisolated func validatedConfiguration(from input: ConnectionInput) throws -> SQLConnectionConfiguration {
+        let configuration = try ConnectionStringParser.validatedConfiguration(from: input)
 
         guard resolvedSQLCmdURL() != nil else {
             throw CompareAppError.sqlcmdNotFound
@@ -378,8 +365,25 @@ struct SQLCmdService: Sendable {
         }
     }
 
+    /// sqlcmd พิมพ์ error บรรทัดเดิมซ้ำทุกครั้งที่ retry — ยุบให้เหลือบรรทัดละครั้ง
+    private nonisolated func collapsingRepeatedLines(_ rawMessage: String) -> String {
+        var seen: Set<String> = []
+
+        return rawMessage
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { line in
+                let key = line.trimmingCharacters(in: .whitespaces)
+                guard !key.isEmpty else { return true }
+                return seen.insert(key).inserted
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private nonisolated func diagnoseQueryError(_ rawMessage: String, configuration: SQLConnectionConfiguration) -> String {
-        let message = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = collapsingRepeatedLines(rawMessage)
         let lowered = message.lowercased()
 
         if lowered.contains("login failed for user") {
@@ -390,6 +394,20 @@ struct SQLCmdService: Sendable {
             - SQL login หรือ password ไม่ถูกต้อง
             - หรือ Azure SQL server นี้เปิด Entra-only authentication อยู่
             - หรือ login `\(configuration.username ?? "(unknown)")` ไม่มีสิทธิ์ใน server/database นี้
+            """
+        }
+
+        if lowered.contains("certificate")
+            || lowered.contains("x509")
+            || lowered.contains("tls handshake")
+            || lowered.contains("ssl provider") {
+            return """
+            \(message)
+
+            Diagnosis:
+            - SQL Server ฝั่งนี้ใช้ self-signed certificate (ค่าปกติของ container และเครื่อง local)
+            - เพิ่ม `Trust Server Certificate=True` ใน connection string
+            - หรือถ้าไม่ต้องการ TLS ให้ตั้ง `Encrypt=False`
             """
         }
 
@@ -406,7 +424,20 @@ struct SQLCmdService: Sendable {
         if lowered.contains("client with ip address")
             || lowered.contains("firewall")
             || lowered.contains("server was not found")
-            || lowered.contains("tcp provider") {
+            || lowered.contains("tcp provider")
+            || lowered.contains("connection refused")
+            || lowered.contains("unable to open tcp connection") {
+            if configuration.isLocalServer {
+                return """
+                \(message)
+
+                Diagnosis:
+                - container ของ SQL Server ยังไม่ได้รัน (`docker ps` เพื่อตรวจ)
+                - หรือยังไม่ได้ map port ออกมาที่เครื่อง (`-p 1433:1433`)
+                - หรือ port ใน `\(configuration.server)` ไม่ตรงกับที่ container map ไว้
+                """
+            }
+
             return """
             \(message)
 
@@ -545,8 +576,12 @@ struct SQLCmdService: Sendable {
     }
 }
 
-enum MetadataQuery {
+nonisolated enum MetadataQuery {
     static let nullToken = "__DOMTA_NULL__"
+
+    /// ครอบค่าที่ส่งกลับมาทีละชิ้น เพื่อกันไม่ให้ sqlcmd ตัดช่องว่างหัวท้ายทิ้ง
+    /// และเพื่อแยกบรรทัดผลลัพธ์จริงออกจากบรรทัดอื่นที่ sqlcmd พิมพ์แทรกมา
+    static let chunkMarker = "|"
 
     static let schema = """
     SET NOCOUNT ON;
@@ -694,6 +729,131 @@ enum MetadataQuery {
     static func quoteIdentifier(_ value: String) -> String {
         "[\(value.replacingOccurrences(of: "]", with: "]]"))]"
     }
+
+    /// ค่า literal สำหรับใส่ในตัว query — escape single quote ตามกติกาของ T-SQL
+    static func stringLiteral(_ value: String) -> String {
+        "N'" + value.replacingOccurrences(of: "'", with: "''") + "'"
+    }
+
+    /// definition ของ view / procedure / function โดยตัดเป็นชิ้นละ 4000 ตัวอักษร
+    ///
+    /// sqlcmd ตัดบรรทัดที่ความกว้าง `-w` — ส่งออกมาเป็นชิ้นสั้น ๆ แล้วต่อกลับใน Swift
+    /// จึงปลอดภัยกว่าการหวังว่า definition ยาว ๆ จะไม่โดนตัด
+    static func moduleDefinition(schemaName: String, objectName: String) -> String {
+        """
+        SET NOCOUNT ON;
+        DECLARE @definition nvarchar(max) = (
+            SELECT TOP 1 m.definition
+            FROM sys.sql_modules m
+            INNER JOIN sys.objects o ON o.object_id = m.object_id
+            INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
+            WHERE s.name = \(stringLiteral(schemaName)) AND o.name = \(stringLiteral(objectName))
+        );
+
+        IF @definition IS NULL
+        BEGIN
+            SELECT N'\(chunkMarker)\(nullToken)\(chunkMarker)';
+        END
+        ELSE
+        BEGIN
+            WITH chunks AS (
+                SELECT 1 AS chunk_index
+                UNION ALL
+                SELECT chunk_index + 1 FROM chunks WHERE chunk_index * 4000 < DATALENGTH(@definition) / 2
+            )
+            SELECT N'\(chunkMarker)' + \(escapedStringExpression(for: "SUBSTRING(@definition, (chunk_index - 1) * 4000 + 1, 4000)")) + N'\(chunkMarker)'
+            FROM chunks
+            ORDER BY chunk_index
+            OPTION (MAXRECURSION 0);
+        END
+        """
+    }
+
+    /// column ของ table หนึ่งตัว พร้อม computed / default / collation
+    static func tableColumnDefinition(schemaName: String, objectName: String) -> String {
+        """
+        SET NOCOUNT ON;
+        SELECT
+            COALESCE(CONVERT(nvarchar(max), c.column_id), N'0'),
+            COALESCE(CONVERT(nvarchar(max), c.name), N''),
+            COALESCE(CONVERT(nvarchar(max), ty.name), N''),
+            COALESCE(CONVERT(nvarchar(max), c.max_length), N'0'),
+            COALESCE(CONVERT(nvarchar(max), c.precision), N'0'),
+            COALESCE(CONVERT(nvarchar(max), c.scale), N'0'),
+            CONVERT(nvarchar(max), CASE WHEN c.is_nullable = 1 THEN 1 ELSE 0 END),
+            CONVERT(nvarchar(max), CASE WHEN c.is_identity = 1 THEN 1 ELSE 0 END),
+            CONVERT(nvarchar(max), CASE WHEN c.is_computed = 1 THEN 1 ELSE 0 END),
+            COALESCE(\(escapedStringExpression(for: "CONVERT(nvarchar(max), cc.definition)")), N''),
+            COALESCE(\(escapedStringExpression(for: "CONVERT(nvarchar(max), dc.definition)")), N''),
+            CONVERT(nvarchar(max), CASE WHEN pk.column_id IS NULL THEN 0 ELSE 1 END),
+            COALESCE(CONVERT(nvarchar(max), c.collation_name), N'')
+        FROM sys.tables t
+        INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+        INNER JOIN sys.columns c ON c.object_id = t.object_id
+        INNER JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+        LEFT JOIN sys.computed_columns cc
+            ON cc.object_id = c.object_id AND cc.column_id = c.column_id
+        LEFT JOIN sys.default_constraints dc
+            ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
+        LEFT JOIN (
+            SELECT ic.object_id, ic.column_id
+            FROM sys.indexes i
+            INNER JOIN sys.index_columns ic
+                ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            WHERE i.is_primary_key = 1
+        ) pk
+            ON pk.object_id = c.object_id AND pk.column_id = c.column_id
+        WHERE s.name = \(stringLiteral(schemaName)) AND t.name = \(stringLiteral(objectName))
+        ORDER BY c.column_id;
+        """
+    }
+
+    /// index และ key constraint ของ table หนึ่งตัว — หนึ่งแถวต่อหนึ่ง index column
+    static func tableIndexDefinition(schemaName: String, objectName: String) -> String {
+        """
+        SET NOCOUNT ON;
+        SELECT
+            COALESCE(CONVERT(nvarchar(max), i.name), N''),
+            CONVERT(nvarchar(max), CASE WHEN i.is_unique = 1 THEN 1 ELSE 0 END),
+            CONVERT(nvarchar(max), CASE WHEN i.is_primary_key = 1 THEN 1 ELSE 0 END),
+            CONVERT(nvarchar(max), CASE WHEN i.is_unique_constraint = 1 THEN 1 ELSE 0 END),
+            COALESCE(CONVERT(nvarchar(max), i.type_desc), N''),
+            COALESCE(CONVERT(nvarchar(max), c.name), N''),
+            CONVERT(nvarchar(max), CASE WHEN ic.is_descending_key = 1 THEN 1 ELSE 0 END),
+            CONVERT(nvarchar(max), CASE WHEN ic.is_included_column = 1 THEN 1 ELSE 0 END)
+        FROM sys.indexes i
+        INNER JOIN sys.tables t ON t.object_id = i.object_id
+        INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+        LEFT JOIN sys.index_columns ic
+            ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+        LEFT JOIN sys.columns c
+            ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+        WHERE s.name = \(stringLiteral(schemaName))
+            AND t.name = \(stringLiteral(objectName))
+            AND i.type > 0
+        ORDER BY i.index_id, ic.is_included_column, ic.key_ordinal, ic.index_column_id;
+        """
+    }
+
+    /// ชื่อชนิดข้อมูลพร้อมความยาว/ความละเอียด ในรูปแบบเดียวกับที่เขียนใน DDL
+    static func formattedTypeName(_ dataType: String, maxLength: Int, precision: Int, scale: Int) -> String {
+        let normalized = dataType.lowercased()
+
+        switch normalized {
+        case "nvarchar", "nchar":
+            return maxLength == -1 ? "\(normalized)(max)" : "\(normalized)(\(maxLength / 2))"
+        case "varchar", "char", "varbinary", "binary":
+            return maxLength == -1 ? "\(normalized)(max)" : "\(normalized)(\(maxLength))"
+        case "decimal", "numeric":
+            return "\(normalized)(\(precision), \(scale))"
+        case "datetime2", "time", "datetimeoffset":
+            return "\(normalized)(\(scale))"
+        case "float":
+            return "\(normalized)(\(precision))"
+        default:
+            return normalized
+        }
+    }
 }
 
 private extension Array {
@@ -701,4 +861,207 @@ private extension Array {
         guard indices.contains(index) else { return nil }
         return self[index]
     }
+}
+
+// MARK: - Schema object definitions
+
+extension SQLCmdService {
+    /// ดึง definition ของ object หนึ่งตัวจากฝั่งใดฝั่งหนึ่ง เพื่อเอาไปเทียบรายบรรทัด
+    ///
+    /// คืน `nil` เมื่อ object ไม่มีอยู่ในฝั่งนั้น (เช่น object ที่มีเฉพาะฝั่ง source)
+    nonisolated func loadObjectDefinition(_ input: ConnectionInput, difference: SchemaDifference) throws -> String? {
+        let configuration = try validatedConfiguration(from: input)
+        let schemaName = difference.schemaName.isEmpty ? "dbo" : difference.schemaName
+        let objectName = difference.objectName
+
+        switch difference.category {
+        case .view, .storedProcedure, .function:
+            return try loadModuleDefinition(schemaName: schemaName, objectName: objectName, configuration: configuration)
+        case .table:
+            return try loadTableDefinition(schemaName: schemaName, objectName: objectName, configuration: configuration)
+        case .other:
+            return nil
+        }
+    }
+
+    /// definition ของ view / procedure / function จาก `sys.sql_modules`
+    private nonisolated func loadModuleDefinition(
+        schemaName: String,
+        objectName: String,
+        configuration: SQLConnectionConfiguration
+    ) throws -> String? {
+        try runChunkedDefinitionQuery(
+            MetadataQuery.moduleDefinition(schemaName: schemaName, objectName: objectName),
+            configuration: configuration
+        )
+    }
+
+    /// อ่านผลลัพธ์ที่ถูกครอบด้วย marker แล้วต่อกลับเป็น definition เดียว
+    ///
+    /// ไม่ใช้ `runDelimitedQuery` เพราะตัวนั้น trim ช่องว่างและตัดบรรทัดที่ขึ้นต้นด้วย `(` ทิ้ง
+    /// ซึ่งจะทำให้ definition ที่ย่อหน้าไว้เพี้ยน
+    private nonisolated func runChunkedDefinitionQuery(
+        _ query: String,
+        configuration: SQLConnectionConfiguration
+    ) throws -> String? {
+        let output = try runRawQuery(query, configuration: configuration)
+        let marker = MetadataQuery.chunkMarker
+
+        let chunks = output
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .filter { $0.hasPrefix(marker) && $0.hasSuffix(marker) && $0.count >= 2 }
+            .map { String($0.dropFirst().dropLast()) }
+
+        guard !chunks.isEmpty else { return nil }
+        guard chunks != [MetadataQuery.nullToken] else { return nil }
+
+        return chunks.map { unescapeRowValue($0) }.joined()
+    }
+
+    /// ประกอบ definition ของ table ขึ้นมาจาก `sys.columns` และ `sys.indexes`
+    ///
+    /// ไม่ใช่ DDL ที่รันได้จริง แต่เป็นรูปแบบคงที่ที่เทียบสองฝั่งแล้วอ่านความต่างได้ง่าย
+    private nonisolated func loadTableDefinition(
+        schemaName: String,
+        objectName: String,
+        configuration: SQLConnectionConfiguration
+    ) throws -> String? {
+        let columnRows = try runDelimitedQuery(
+            MetadataQuery.tableColumnDefinition(schemaName: schemaName, objectName: objectName),
+            configuration: configuration,
+            expectedColumnCount: 13
+        )
+
+        guard !columnRows.isEmpty else { return nil }
+
+        let indexRows = try runDelimitedQuery(
+            MetadataQuery.tableIndexDefinition(schemaName: schemaName, objectName: objectName),
+            configuration: configuration,
+            expectedColumnCount: 8
+        )
+
+        var lines = ["CREATE TABLE [\(schemaName)].[\(objectName)] ("]
+        var bodyLines = columnRows.map { columnDefinitionLine(from: $0) }
+        bodyLines.append(contentsOf: constraintDefinitionLines(from: indexRows))
+
+        for (index, line) in bodyLines.enumerated() {
+            lines.append("    " + line + (index == bodyLines.count - 1 ? "" : ","))
+        }
+
+        lines.append(");")
+        lines.append(contentsOf: indexDefinitionLines(from: indexRows))
+
+        return lines.joined(separator: "\n")
+    }
+
+    private nonisolated func columnDefinitionLine(from row: [String]) -> String {
+        let name = row[1]
+        let dataType = row[2]
+        let maxLength = Int(row[3]) ?? 0
+        let precision = Int(row[4]) ?? 0
+        let scale = Int(row[5]) ?? 0
+        let isNullable = parseBoolFlag(row[6])
+        let isIdentity = parseBoolFlag(row[7])
+        let isComputed = parseBoolFlag(row[8])
+        let computedDefinition = unescapeRowValue(row[9])
+        let defaultDefinition = unescapeRowValue(row[10])
+        let collation = row[12]
+
+        if isComputed {
+            return "[\(name)] AS \(computedDefinition)"
+        }
+
+        var parts = ["[\(name)]", MetadataQuery.formattedTypeName(dataType, maxLength: maxLength, precision: precision, scale: scale)]
+
+        if !collation.isEmpty {
+            parts.append("COLLATE \(collation)")
+        }
+
+        if isIdentity {
+            parts.append("IDENTITY")
+        }
+
+        parts.append(isNullable ? "NULL" : "NOT NULL")
+
+        if !defaultDefinition.isEmpty {
+            parts.append("DEFAULT \(defaultDefinition)")
+        }
+
+        return parts.joined(separator: " ")
+    }
+
+    /// primary key และ unique constraint เขียนไว้ในตัว table เหมือน DDL จริง
+    private nonisolated func constraintDefinitionLines(from rows: [[String]]) -> [String] {
+        groupedIndexes(from: rows).compactMap { index in
+            if index.isPrimaryKey {
+                return "CONSTRAINT [\(index.name)] PRIMARY KEY \(index.typeDescription) (\(index.keyColumns.joined(separator: ", ")))"
+            }
+
+            if index.isUniqueConstraint {
+                return "CONSTRAINT [\(index.name)] UNIQUE \(index.typeDescription) (\(index.keyColumns.joined(separator: ", ")))"
+            }
+
+            return nil
+        }
+    }
+
+    private nonisolated func indexDefinitionLines(from rows: [[String]]) -> [String] {
+        groupedIndexes(from: rows).compactMap { index in
+            guard !index.isPrimaryKey, !index.isUniqueConstraint else { return nil }
+
+            var line = "CREATE \(index.isUnique ? "UNIQUE " : "")\(index.typeDescription) INDEX [\(index.name)] (\(index.keyColumns.joined(separator: ", ")))"
+
+            if !index.includedColumns.isEmpty {
+                line += " INCLUDE (\(index.includedColumns.joined(separator: ", ")))"
+            }
+
+            return line + ";"
+        }
+    }
+
+    private nonisolated func groupedIndexes(from rows: [[String]]) -> [IndexDefinition] {
+        var ordered: [String] = []
+        var indexes: [String: IndexDefinition] = [:]
+
+        for row in rows {
+            let name = row[0]
+            guard !name.isEmpty else { continue }
+
+            if indexes[name] == nil {
+                ordered.append(name)
+                indexes[name] = IndexDefinition(
+                    name: name,
+                    isUnique: parseBoolFlag(row[1]),
+                    isPrimaryKey: parseBoolFlag(row[2]),
+                    isUniqueConstraint: parseBoolFlag(row[3]),
+                    typeDescription: row[4].uppercased(),
+                    keyColumns: [],
+                    includedColumns: []
+                )
+            }
+
+            let columnName = row[5]
+            guard !columnName.isEmpty else { continue }
+
+            if parseBoolFlag(row[7]) {
+                indexes[name]?.includedColumns.append("[\(columnName)]")
+            } else {
+                indexes[name]?.keyColumns.append("[\(columnName)]" + (parseBoolFlag(row[6]) ? " DESC" : ""))
+            }
+        }
+
+        return ordered.compactMap { indexes[$0] }
+    }
+}
+
+private nonisolated struct IndexDefinition {
+    let name: String
+    let isUnique: Bool
+    let isPrimaryKey: Bool
+    let isUniqueConstraint: Bool
+    let typeDescription: String
+    var keyColumns: [String]
+    var includedColumns: [String]
 }
