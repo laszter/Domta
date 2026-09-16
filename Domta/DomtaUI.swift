@@ -152,6 +152,7 @@ extension SchemaChangeKind {
         case .alter: return .orange
         case .drop: return .red
         case .rebuild: return .purple
+        case .recreate: return .pink
         case .other: return .secondary
         }
     }

@@ -7,10 +7,38 @@ import Foundation
 
 /// เรียก `sqlpackage` เพื่อเทียบ schema ระหว่าง source กับ target
 ///
-/// `sqlpackage /Action:Script` ไม่รับ database ทั้งสองฝั่ง — source ต้องเป็นไฟล์ `.dacpac`
-/// flow จึงเป็น Extract source ออกมาเป็น dacpac ก่อน แล้วค่อย Script เทียบกับ target
+/// flow: Extract **ทั้งสองฝั่ง** ออกมาเป็น `.dacpac` ก่อน แล้วค่อย Script แบบ dacpac ต่อ dacpac
 /// โดยขอ deployment report (XML) ออกมาพร้อมกันในรอบเดียว
+///
+/// เหตุที่ extract target ด้วยแทนที่จะ Script ใส่ database สด:
+/// - dacpac ทั้งคู่ถูกเก็บไว้ใน `SchemaCompareWorkspace` ตลอด session ให้ `DacFxScriptService`
+///   ออก script เฉพาะ object ที่เลือกได้โดยไม่ต้องต่อ database อีก (เร็ว และทำซ้ำได้ผลเดิม)
+/// - Compare API ของ DacFx จะฟ้อง "target database was modified after schema comparison was
+///   completed" ถ้า catalog ของ target ขยับระหว่าง compare กับ generate (job ของแอปบน target,
+///   auto-created statistics) — snapshot เป็นไฟล์ตัดปัญหานี้ทิ้งทั้งชั้น
+/// - ต้นทุนเท่าเดิม: Script ใส่ database สดก็ต้องโหลด model ของ target ทั้งก้อนอยู่แล้ว
+///
+/// ฝั่งที่ผู้ใช้เลือกเป็นไฟล์ `.dacpac` ข้ามขั้น Extract ไปเลย — ไฟล์นั้นคือ snapshot อยู่แล้ว
 nonisolated final class SqlPackageService: @unchecked Sendable {
+    /// ฝั่งหนึ่งที่ตรวจแล้ว — database ต้อง extract ก่อน ส่วนไฟล์ dacpac ส่งให้ sqlpackage ได้ทันที
+    private enum ResolvedEndpoint {
+        case database(SQLConnectionConfiguration)
+        case dacpac(URL)
+
+        var dacpacURL: URL? {
+            if case .dacpac(let url) = self { return url }
+            return nil
+        }
+
+        /// ชื่อที่ใส่ใน `/TargetDatabaseName` และหัว script — ไฟล์ dacpac ไม่มีชื่อ database จึงใช้ชื่อไฟล์
+        var databaseName: String {
+            switch self {
+            case .database(let configuration): return configuration.database ?? "Target"
+            case .dacpac(let url): return url.deletingPathExtension().lastPathComponent
+            }
+        }
+    }
+
     private let processLock = NSLock()
     private var runningProcess: Process?
     private var isCancelled = false
@@ -69,8 +97,8 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
     // MARK: - Compare
 
     nonisolated func compareSchema(
-        source: ConnectionInput,
-        target: ConnectionInput,
+        source: SchemaCompareEndpoint,
+        target: SchemaCompareEndpoint,
         options: SchemaCompareOptions,
         progress: (@Sendable (ProgressState) -> Void)? = nil
     ) throws -> SchemaCompareReport {
@@ -80,83 +108,133 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
             throw CompareAppError.sqlPackageNotFound
         }
 
-        let sourceConfig = try ConnectionStringParser.validatedConfiguration(from: source)
-        let targetConfig = try ConnectionStringParser.validatedConfiguration(from: target)
+        let resolvedSource = try resolve(source)
+        let resolvedTarget = try resolve(target)
 
-        let workingDirectory = try makeWorkingDirectory()
-        defer { try? FileManager.default.removeItem(at: workingDirectory) }
+        let workspace = try makeWorkspace(source: resolvedSource, target: resolvedTarget)
 
-        let dacpacURL = workingDirectory.appendingPathComponent("source.dacpac")
-        let scriptURL = workingDirectory.appendingPathComponent("deploy.sql")
-        let reportURL = workingDirectory.appendingPathComponent("report.xml")
+        do {
+            try runCompare(source: resolvedSource, target: resolvedTarget, options: options, workspace: workspace, progress: progress)
+        } catch {
+            workspace.cleanUp()
+            throw error
+        }
+
+        let reportURL = workspace.directory.appendingPathComponent("report.xml")
+        let scriptURL = workspace.directory.appendingPathComponent("deploy.sql")
+
+        progress?(
+            ProgressState(message: "Reading deployment report...", completedUnitCount: 3, totalUnitCount: 4, showsIndeterminateSpinner: false)
+        )
+
+        let report: DeployReportParser.Output
+        do {
+            report = try DeployReportParser.parse(contentsOf: reportURL)
+        } catch {
+            workspace.cleanUp()
+            throw error
+        }
+
+        let script = (try? String(contentsOf: scriptURL, encoding: .utf8)) ?? ""
+
+        // report บอกแค่ `[schema].[ConstraintName]` สำหรับ FK/default/check constraint — หา table แม่จาก
+        // ALTER TABLE ใน script เพื่อให้ตารางยุบมันเข้าแถวของ table แทนที่จะโผล่เป็นแถวของตัวเอง
+        let differences = DeployReportParser.resolvingParents(of: report.differences, script: script)
 
         progress?(
             ProgressState(
-                message: "Extracting source schema (\(sourceConfig.database ?? sourceConfig.server))...",
-                completedUnitCount: 0,
-                totalUnitCount: 3,
+                message: "Found \(report.differences.count) schema differences",
+                completedUnitCount: 4,
+                totalUnitCount: 4,
                 showsIndeterminateSpinner: false
             )
         )
 
-        try runSqlPackage(
-            arguments: extractArguments(configuration: sourceConfig, outputURL: dacpacURL),
-            configuration: sourceConfig,
-            stage: "Extract",
-            progress: { message in
-                progress?(
-                    ProgressState(message: message, completedUnitCount: 0, totalUnitCount: 3, showsIndeterminateSpinner: false)
-                )
-            }
+        return SchemaCompareReport(
+            differences: differences,
+            alerts: report.alerts,
+            script: script,
+            generatedAt: Date(),
+            workspace: workspace
         )
+    }
+
+    private nonisolated func resolve(_ endpoint: SchemaCompareEndpoint) throws -> ResolvedEndpoint {
+        switch endpoint {
+        case .database(let input):
+            return .database(try ConnectionStringParser.validatedConfiguration(from: input))
+
+        case .dacpac(let url):
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+                throw CompareAppError.dacpacNotFound(url.path)
+            }
+            return .dacpac(url)
+        }
+    }
+
+    private nonisolated func runCompare(
+        source: ResolvedEndpoint,
+        target: ResolvedEndpoint,
+        options: SchemaCompareOptions,
+        workspace: SchemaCompareWorkspace,
+        progress: (@Sendable (ProgressState) -> Void)?
+    ) throws {
+        let stages: [(label: String, endpoint: ResolvedEndpoint, output: URL)] = [
+            ("source", source, workspace.sourceDacpac),
+            ("target", target, workspace.targetDacpac)
+        ]
+
+        for (index, stage) in stages.enumerated() {
+            // ฝั่งที่เป็นไฟล์ dacpac อยู่แล้วไม่ต้อง extract — workspace ชี้ไปที่ไฟล์นั้นตรง ๆ
+            guard case .database(let configuration) = stage.endpoint else { continue }
+
+            progress?(
+                ProgressState(
+                    message: "Extracting \(stage.label) schema (\(configuration.database ?? configuration.server))...",
+                    completedUnitCount: index,
+                    totalUnitCount: 4,
+                    showsIndeterminateSpinner: false
+                )
+            )
+
+            try runSqlPackage(
+                arguments: extractArguments(configuration: configuration, outputURL: stage.output),
+                configuration: configuration,
+                stage: "Extract \(stage.label)",
+                progress: { message in
+                    progress?(
+                        ProgressState(message: message, completedUnitCount: index, totalUnitCount: 4, showsIndeterminateSpinner: false)
+                    )
+                }
+            )
+        }
 
         progress?(
             ProgressState(
-                message: "Comparing against target (\(targetConfig.database ?? targetConfig.server))...",
-                completedUnitCount: 1,
-                totalUnitCount: 3,
+                message: "Comparing dacpacs (\(workspace.targetDatabaseName))...",
+                completedUnitCount: 2,
+                totalUnitCount: 4,
                 showsIndeterminateSpinner: false
             )
         )
 
         try runSqlPackage(
             arguments: scriptArguments(
-                sourceFile: dacpacURL,
-                configuration: targetConfig,
-                scriptURL: scriptURL,
-                reportURL: reportURL,
+                sourceFile: workspace.sourceDacpac,
+                targetFile: workspace.targetDacpac,
+                targetDatabaseName: workspace.targetDatabaseName,
+                scriptURL: workspace.directory.appendingPathComponent("deploy.sql"),
+                reportURL: workspace.directory.appendingPathComponent("report.xml"),
                 options: options
             ),
-            configuration: targetConfig,
+            configuration: nil,
             stage: "Script",
             progress: { message in
                 progress?(
-                    ProgressState(message: message, completedUnitCount: 1, totalUnitCount: 3, showsIndeterminateSpinner: false)
+                    ProgressState(message: message, completedUnitCount: 2, totalUnitCount: 4, showsIndeterminateSpinner: false)
                 )
             }
-        )
-
-        progress?(
-            ProgressState(message: "Reading deployment report...", completedUnitCount: 2, totalUnitCount: 3, showsIndeterminateSpinner: false)
-        )
-
-        let report = try DeployReportParser.parse(contentsOf: reportURL)
-        let script = (try? String(contentsOf: scriptURL, encoding: .utf8)) ?? ""
-
-        progress?(
-            ProgressState(
-                message: "Found \(report.differences.count) schema differences",
-                completedUnitCount: 3,
-                totalUnitCount: 3,
-                showsIndeterminateSpinner: false
-            )
-        )
-
-        return SchemaCompareReport(
-            differences: report.differences,
-            alerts: report.alerts,
-            script: script,
-            generatedAt: Date()
         )
     }
 
@@ -176,9 +254,11 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
         ]
     }
 
+    /// Script แบบ dacpac ต่อ dacpac — ต้องส่ง `/TargetDatabaseName` เพราะไฟล์ไม่มีชื่อ database ในตัว
     private nonisolated func scriptArguments(
         sourceFile: URL,
-        configuration: SQLConnectionConfiguration,
+        targetFile: URL,
+        targetDatabaseName: String,
         scriptURL: URL,
         reportURL: URL,
         options: SchemaCompareOptions
@@ -186,7 +266,8 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
         var arguments = [
             "/Action:Script",
             "/SourceFile:\(sourceFile.path)",
-            "/TargetConnectionString:\(Self.connectionString(for: configuration))",
+            "/TargetFile:\(targetFile.path)",
+            "/TargetDatabaseName:\(targetDatabaseName)",
             "/DeployScriptPath:\(scriptURL.path)",
             "/DeployReportPath:\(reportURL.path)",
             "/OverwriteFiles:True",
@@ -254,7 +335,12 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
 
     // MARK: - Process execution
 
-    private nonisolated func makeWorkingDirectory() throws -> URL {
+    /// โฟลเดอร์ชั่วคราวของ compare รอบนี้ — อยู่ต่อจน view model ล้างทิ้ง (compare ใหม่ / ปิดหน้า)
+    /// เพราะ dacpac ข้างในถูกใช้ต่อตอนออก script เฉพาะ object ที่เลือก
+    ///
+    /// ฝั่งที่เป็นไฟล์ dacpac ไม่ถูก copy เข้ามา — ให้ reference ไปยัง dacpac อื่นที่วางคู่กัน
+    /// (เช่น master.dacpac ใน bin ของ SQL project) ยัง resolve ได้จากโฟลเดอร์เดิม
+    private nonisolated func makeWorkspace(source: ResolvedEndpoint, target: ResolvedEndpoint) throws -> SchemaCompareWorkspace {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("domta-schema-\(UUID().uuidString)", isDirectory: true)
 
@@ -268,7 +354,12 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
             throw CompareAppError.sqlPackageFailed("สร้างโฟลเดอร์ชั่วคราวไม่สำเร็จ: \(error.localizedDescription)")
         }
 
-        return url
+        return SchemaCompareWorkspace(
+            directory: url,
+            sourceDacpac: source.dacpacURL ?? url.appendingPathComponent("source.dacpac"),
+            targetDacpac: target.dacpacURL ?? url.appendingPathComponent("target.dacpac"),
+            targetDatabaseName: target.databaseName
+        )
     }
 
     /// เขียน argument ลง response file แล้วส่งเป็น `@file`
@@ -278,7 +369,7 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
     @discardableResult
     private func runSqlPackage(
         arguments: [String],
-        configuration: SQLConnectionConfiguration,
+        configuration: SQLConnectionConfiguration?,
         stage: String,
         progress: (@Sendable (String) -> Void)? = nil
     ) throws -> String {
@@ -380,7 +471,8 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
 
     // MARK: - Diagnosis
 
-    static func diagnose(rawMessage: String, stage: String, configuration: SQLConnectionConfiguration) -> String {
+    /// `configuration` เป็น `nil` ใน stage ที่ไม่ได้ต่อ database (Script แบบ dacpac ต่อ dacpac)
+    static func diagnose(rawMessage: String, stage: String, configuration: SQLConnectionConfiguration?) -> String {
         let message = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         let lowered = message.lowercased()
 
@@ -390,7 +482,7 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
 
             Diagnosis (\(stage)):
             - SQL login หรือ password ไม่ถูกต้อง
-            - หรือ login `\(configuration.username ?? "(unknown)")` ไม่มีสิทธิ์ในฐานข้อมูลนี้
+            - หรือ login `\(configuration?.username ?? "(unknown)")` ไม่มีสิทธิ์ในฐานข้อมูลนี้
             - schema compare ต้องการสิทธิ์อ่าน metadata (`VIEW DEFINITION`) ของทุก object
             """
         }
@@ -421,7 +513,7 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
             || lowered.contains("connection refused")
             || lowered.contains("server was not found")
             || lowered.contains("firewall") {
-            if configuration.isLocalServer {
+            if let configuration, configuration.isLocalServer {
                 return """
                 \(message)
 
@@ -444,7 +536,7 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
             \(message)
 
             Diagnosis (\(stage)):
-            - login ผ่านแล้ว แต่ไม่มีสิทธิ์เข้า database `\(configuration.database ?? "(unknown)")`
+            - login ผ่านแล้ว แต่ไม่มีสิทธิ์เข้า database `\(configuration?.database ?? "(unknown)")`
             - หรือชื่อ database ไม่ถูกต้อง
             """
         }
@@ -454,7 +546,8 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
 }
 
 /// รวบรวม stdout/stderr แบบ thread-safe และส่งบรรทัดล่าสุดออกไปเป็น progress
-private nonisolated final class OutputCollector: @unchecked Sendable {
+/// ใช้ร่วมกันระหว่าง `SqlPackageService` กับ `DacFxScriptService`
+nonisolated final class OutputCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var standardOutputData = Data()
     private var standardErrorData = Data()

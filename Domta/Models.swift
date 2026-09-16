@@ -394,6 +394,9 @@ enum CompareAppError: LocalizedError {
     case sqlcmdNotFound
     case sqlPackageNotFound
     case sqlPackageFailed(String)
+    case dacpacNotFound(String)
+    case dotnetNotFound
+    case dacFxHelperFailed(String)
     case operationCancelled
     case placeholderPassword
     case queryFailed(String)
@@ -429,6 +432,16 @@ enum CompareAppError: LocalizedError {
             """
         case .sqlPackageFailed(let message):
             return "sqlpackage ทำงานไม่สำเร็จ: \(message)"
+        case .dacpacNotFound(let path):
+            return "ไม่พบไฟล์ dacpac `\(path)` — กลับไปเลือกไฟล์ใหม่ในหน้า Connections"
+        case .dotnetNotFound:
+            return """
+            ไม่พบ `dotnet` ในเครื่อง — script เฉพาะ object ที่เลือกต้องใช้ .NET SDK 10 ขึ้นไปรัน DacFx helper
+
+            ติดตั้ง .NET SDK แล้วตรวจว่า `dotnet --version` ตอบ 10.x ขึ้นไป (ตัวเดียวกับที่ใช้ติดตั้ง sqlpackage)
+            """
+        case .dacFxHelperFailed(let message):
+            return "DacFx helper ทำงานไม่สำเร็จ: \(message)"
         case .operationCancelled:
             return "ยกเลิกการทำงานแล้ว"
         case .placeholderPassword:

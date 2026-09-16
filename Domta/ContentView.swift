@@ -107,8 +107,8 @@ struct ContentView: View {
                     case .schemaCompare:
                         SchemaCompareView(
                             viewModel: schemaViewModel,
-                            source: viewModel.sourceInput,
-                            target: viewModel.targetInput,
+                            source: viewModel.sourceSchemaEndpoint,
+                            target: viewModel.targetSchemaEndpoint,
                             onEditConnections: { path.removeAll() },
                             onShowScript: {
                                 schemaViewModel.prepareScript()
@@ -304,7 +304,7 @@ struct ContentView: View {
     }
 
     private var connectionEditorsSection: some View {
-        sectionCard(title: "Connections", subtitle: "วาง source และ target connection string แล้วเลือกโหมดที่ต้องการเทียบ") {
+        sectionCard(title: "Connections", subtitle: "วาง source และ target connection string แล้วเลือกโหมดที่ต้องการเทียบ — Schema Compare เลือกฝั่งใดเป็นไฟล์ .dacpac แทนได้") {
             VStack(spacing: 16) {
                 modePicker
 
@@ -317,7 +317,10 @@ struct ContentView: View {
                         prompt: "Data Source=your-server-name.database.windows.net,1433;Database=your-database-name;User ID=your-username;Password=your-password;Encrypt=True;Trust Server Certificate=True;",
                         isTesting: viewModel.isTestingSourceConnection,
                         testAction: viewModel.testSourceConnection,
-                        testMessage: viewModel.sourceTestMessage
+                        testMessage: viewModel.sourceTestMessage,
+                        endpointKind: $viewModel.sourceSchemaEndpointKind,
+                        dacpacPath: viewModel.sourceDacpacPath,
+                        chooseDacpac: viewModel.chooseSourceDacpac
                     )
 
                     connectionEditor(
@@ -328,7 +331,10 @@ struct ContentView: View {
                         prompt: "Data Source=your-server-name.database.windows.net,1433;Database=your-database-name;User ID=your-username;Password=your-password;Encrypt=True;Trust Server Certificate=True;",
                         isTesting: viewModel.isTestingTargetConnection,
                         testAction: viewModel.testTargetConnection,
-                        testMessage: viewModel.targetTestMessage
+                        testMessage: viewModel.targetTestMessage,
+                        endpointKind: $viewModel.targetSchemaEndpointKind,
+                        dacpacPath: viewModel.targetDacpacPath,
+                        chooseDacpac: viewModel.chooseTargetDacpac
                     )
                 }
 
@@ -354,18 +360,31 @@ struct ContentView: View {
                             path.append(.schemaCompare)
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(viewModel.isBusy || !schemaViewModel.isSqlPackageAvailable)
+                        .disabled(viewModel.isBusy || !schemaViewModel.isSqlPackageAvailable || !viewModel.hasRequiredDacpacFiles)
 
-                        Text(schemaViewModel.isSqlPackageAvailable
-                             ? "เทียบโครงสร้างทั้งสองฝั่ง แล้วติ๊กเลือก table / view / stored procedure ที่สนใจในตารางผลลัพธ์"
-                             : "ไม่พบ `sqlpackage` — ติดตั้งด้วย `dotnet tool install --global microsoft.sqlpackage`")
-                            .font(.caption)
-                            .foregroundStyle(schemaViewModel.isSqlPackageAvailable ? Color.secondary : Color.orange)
+                        schemaCompareHint
                     }
 
                     Spacer()
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var schemaCompareHint: some View {
+        if !schemaViewModel.isSqlPackageAvailable {
+            Text("ไม่พบ `sqlpackage` — ติดตั้งด้วย `dotnet tool install --global microsoft.sqlpackage`")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        } else if !viewModel.hasRequiredDacpacFiles {
+            Text("เลือกไฟล์ .dacpac ให้ฝั่งที่ตั้งเป็น DACPAC File ก่อน")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        } else {
+            Text("เทียบโครงสร้างทั้งสองฝั่ง แล้วติ๊กเลือก table / view / stored procedure ที่สนใจในตารางผลลัพธ์")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -396,9 +415,15 @@ struct ContentView: View {
         prompt: String,
         isTesting: Bool,
         testAction: @escaping () -> Void,
-        testMessage: String?
+        testMessage: String?,
+        endpointKind: Binding<SchemaEndpointKind>,
+        dacpacPath: String,
+        chooseDacpac: @escaping () -> Void
     ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        // ไฟล์ dacpac ใช้ได้เฉพาะ schema compare — data compare ต้อง query ข้อมูลจาก database จริง
+        let usesDacpac = viewModel.compareMode == .schema && endpointKind.wrappedValue == .dacpac
+
+        return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(title)
@@ -410,69 +435,38 @@ struct ContentView: View {
 
                 Spacer()
 
-                Button("Test Connection") {
-                    testAction()
-                }
-                .buttonStyle(.bordered)
-                .disabled(isTesting || viewModel.isBusy)
-            }
-
-            TextEditor(text: text)
-                .font(.system(.body, design: .monospaced))
-                .frame(minHeight: 150)
-                .scrollContentBackground(.hidden)
-                .padding(10)
-                .background {
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(Color(nsColor: .textBackgroundColor))
-                }
-                .overlay {
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-                }
-                .overlay(alignment: .topTrailing) {
-                    if isTesting {
-                        ProgressView()
-                            .controlSize(.small)
-                            .padding(14)
+                if !usesDacpac {
+                    Button("Test Connection") {
+                        testAction()
                     }
-                }
-                .overlay(alignment: .topLeading) {
-                    if text.wrappedValue.isEmpty {
-                        Text(prompt)
-                            .font(.system(.body, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                            .padding(14)
-                            .allowsHitTesting(false)
-                    }
-                }
-
-            if needsManualPassword {
-                VStack(alignment: .leading, spacing: 6) {
-                    SecureField("Password", text: password)
-                        .textFieldStyle(.plain)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background {
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(Color(nsColor: .textBackgroundColor))
-                        }
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-                        }
-
-                    Text("connection string นี้ไม่มี `Password=` — ใส่รหัสผ่านที่นี่ (เก็บไว้ระหว่างเปิดแอปเท่านั้น ไม่ถูกบันทึกลงดิสก์)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    .buttonStyle(.bordered)
+                    .disabled(isTesting || viewModel.isBusy)
                 }
             }
 
-            if let testMessage, !testMessage.isEmpty {
-                Text(testMessage)
-                    .font(.caption)
-                    .foregroundStyle(testMessage.lowercased().contains("connected to") ? Color.secondary : Color.red)
-                    .textSelection(.enabled)
+            if viewModel.compareMode == .schema {
+                Picker("\(title) type", selection: endpointKind) {
+                    ForEach(SchemaEndpointKind.allCases) { kind in
+                        Label(kind.title, systemImage: kind.systemImage)
+                            .tag(kind)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(viewModel.isBusy)
+            }
+
+            if usesDacpac {
+                dacpacField(path: dacpacPath, chooseDacpac: chooseDacpac)
+            } else {
+                connectionStringFields(
+                    text: text,
+                    password: password,
+                    needsManualPassword: needsManualPassword,
+                    prompt: prompt,
+                    isTesting: isTesting,
+                    testMessage: testMessage
+                )
             }
         }
         .padding(18)
@@ -484,6 +478,125 @@ struct ContentView: View {
         .overlay {
             RoundedRectangle(cornerRadius: 20)
                 .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    private func dacpacField(path: String, chooseDacpac: @escaping () -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: SchemaEndpointKind.dacpac.systemImage)
+                    .font(.system(size: 26))
+                    .foregroundStyle(path.isEmpty ? Color.secondary : Color.accentColor)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(path.isEmpty ? "ยังไม่ได้เลือกไฟล์ .dacpac" : URL(fileURLWithPath: path).lastPathComponent)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    if !path.isEmpty {
+                        Text(path)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                Button(path.isEmpty ? "Choose File..." : "Change...") {
+                    chooseDacpac()
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.isBusy)
+            }
+
+            Spacer(minLength: 0)
+
+            Text("ใช้ schema ในไฟล์ตรง ๆ ไม่ต้องต่อ database — definition ใน Comparison Details อ่านจาก dacpac ด้วย DacFx (ต้องมี dotnet)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 150, alignment: .topLeading)
+        .background {
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(nsColor: .textBackgroundColor))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        }
+    }
+
+    @ViewBuilder
+    private func connectionStringFields(
+        text: Binding<String>,
+        password: Binding<String>,
+        needsManualPassword: Bool,
+        prompt: String,
+        isTesting: Bool,
+        testMessage: String?
+    ) -> some View {
+        TextEditor(text: text)
+            .font(.system(.body, design: .monospaced))
+            .frame(minHeight: 150)
+            .scrollContentBackground(.hidden)
+            .padding(10)
+            .background {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color(nsColor: .textBackgroundColor))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+            }
+            .overlay(alignment: .topTrailing) {
+                if isTesting {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(14)
+                }
+            }
+            .overlay(alignment: .topLeading) {
+                if text.wrappedValue.isEmpty {
+                    Text(prompt)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .padding(14)
+                        .allowsHitTesting(false)
+                }
+            }
+
+        if needsManualPassword {
+            VStack(alignment: .leading, spacing: 6) {
+                SecureField("Password", text: password)
+                    .textFieldStyle(.plain)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .background {
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(Color(nsColor: .textBackgroundColor))
+                    }
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                    }
+
+                Text("connection string นี้ไม่มี `Password=` — ใส่รหัสผ่านที่นี่ (เก็บไว้ระหว่างเปิดแอปเท่านั้น ไม่ถูกบันทึกลงดิสก์)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+
+        if let testMessage, !testMessage.isEmpty {
+            Text(testMessage)
+                .font(.caption)
+                .foregroundStyle(testMessage.lowercased().contains("connected to") ? Color.secondary : Color.red)
+                .textSelection(.enabled)
         }
     }
 

@@ -26,11 +26,20 @@ final class SchemaCompareViewModel: ObservableObject {
     @Published var definitionState: SchemaDefinitionState = .idle
     @Published var diffViewMode: SchemaDiffViewMode = .sideBySide
     @Published var showsFullScript = false
+    @Published var scriptFormat: SchemaScriptFormat = .plainTSQL
     @Published private(set) var scriptFilter: DeploymentScriptFilterResult?
+    @Published private(set) var selectedScriptState: SelectedScriptState = .idle
 
     private let sqlPackageService = SqlPackageService()
     private let sqlCmdService = SQLCmdService()
+    private let dacFxService = DacFxScriptService()
+    private let definitionService = DacFxScriptService()
+    /// definition จาก dacpac ของ report ปัจจุบัน — helper อ่านทุก object รอบเดียวแล้วใช้ซ้ำทุกแถว
+    private var dacpacDefinitionsTask: Task<[String: DacFxObjectDefinition], Error>?
     private var definitionTaskToken = 0
+    private var scriptTaskToken = 0
+    /// selection ที่ script ปัจจุบันถูกออกมาให้ — เปลี่ยนติ๊กแล้วกลับมาหน้า script จะออกใหม่
+    private var scriptSelection: Set<SchemaCompareRow.ID>?
 
     // MARK: - Tool availability
 
@@ -40,6 +49,10 @@ final class SchemaCompareViewModel: ObservableObject {
 
     var isSqlPackageAvailable: Bool {
         sqlPackagePath != nil
+    }
+
+    var isDotnetAvailable: Bool {
+        dacFxService.isAvailable
     }
 
     // MARK: - Derived state
@@ -124,31 +137,149 @@ final class SchemaCompareViewModel: ObservableObject {
         !generatedScript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// script ที่แสดงและคัดลอกจริง — ค่าเริ่มต้นคือเฉพาะ object ที่ติ๊กไว้
+    /// script ที่แสดงและคัดลอกจริง — ค่าเริ่มต้นคือเฉพาะ object ที่ติ๊กไว้ ในรูป T-SQL ล้วน
     var displayedScript: String {
-        guard !showsFullScript, let scriptFilter else { return generatedScript }
-        return scriptFilter.script
+        let base: String
+        if showsFullScript {
+            base = generatedScript
+        } else if let result = selectedScriptState.result {
+            base = result.script
+        } else {
+            base = ""
+        }
+
+        switch scriptFormat {
+        case .plainTSQL:
+            return DeploymentScriptSanitizer.plainTSQL(base).script
+        case .sqlcmd:
+            return base
+        }
     }
 
-    /// ตัด script ให้เหลือเฉพาะ object ที่ติ๊กไว้ — เรียกก่อนเปิดหน้า script ทุกครั้ง
+    /// คัดลอก/บันทึกได้เมื่อมี script และไม่ได้กำลังออก script อยู่
+    var canExportScript: Bool {
+        !selectedScriptState.isGenerating && !displayedScript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// key ที่ helper ใช้จับคู่กับ difference ของ DacFx — `schema.object` ตัวพิมพ์เล็ก
+    /// (object ที่ไม่มี schema เช่น `SqlSchema` ใช้ชื่อเดี่ยว ๆ ตรงกับ name parts ของ DacFx)
+    static func objectKey(for row: SchemaCompareRow) -> String {
+        objectKey(schemaName: row.schemaName, objectName: row.objectName)
+    }
+
+    static func objectKey(schemaName: String, objectName: String) -> String {
+        let object = objectName.lowercased()
+        return schemaName.isEmpty ? object : "\(schemaName.lowercased()).\(object)"
+    }
+
+    /// ออก script เฉพาะ object ที่ติ๊กไว้ — เรียกก่อนเปิดหน้า script ทุกครั้ง
+    ///
+    /// ทางหลักคือ DacFx helper (exclude แล้วให้ DacFx ลาก dependency มาเอง) ถ้า helper ใช้ไม่ได้
+    /// จะถอยไปใช้ตัวตัด script แบบข้อความ พร้อมบอกเหตุผล — script ทางสำรองอาจรันไม่ผ่านถ้าติด dependency
     func prepareScript() {
         guard let report else {
             scriptFilter = nil
+            selectedScriptState = .idle
+            scriptSelection = nil
+            return
+        }
+
+        let selection = includedRowIDs
+        if scriptSelection == selection, selectedScriptState.result != nil || selectedScriptState.isGenerating {
             return
         }
 
         let allRows = rows
-        let knownNames = Set(allRows.map { "\($0.schemaName.lowercased()).\($0.objectName.lowercased())" })
-        let includedNames = Set(
-            allRows
-                .filter { includedRowIDs.contains($0.id) }
-                .map { "\($0.schemaName.lowercased()).\($0.objectName.lowercased())" }
-        )
+        let knownNames = Set(allRows.map(Self.objectKey))
+        let includedKeys = allRows.filter { selection.contains($0.id) }.map(Self.objectKey)
 
-        scriptFilter = DeploymentScriptFilter.filter(
+        let fallback = DeploymentScriptFilter.filter(
             script: report.script,
-            includedNames: includedNames,
+            includedNames: Set(includedKeys),
             knownNames: knownNames
+        )
+        scriptFilter = fallback
+        scriptSelection = selection
+        scriptTaskToken += 1
+        let token = scriptTaskToken
+
+        // ไม่ได้ติ๊กอะไรเลย — ไม่ต้องรัน helper (DacFx ถือว่า "ไม่มีอะไรจะ deploy" เป็น error)
+        guard !includedKeys.isEmpty else {
+            selectedScriptState = .ready(
+                SelectedScriptResult(
+                    script: "-- No objects selected: nothing to deploy.\n",
+                    source: .dacFx,
+                    included: [],
+                    forcedIncluded: [],
+                    excludedCount: allRows.count,
+                    differenceCount: allRows.count,
+                    warnings: [],
+                    fallbackReason: nil,
+                    filter: nil
+                )
+            )
+            return
+        }
+
+        guard dacFxService.isAvailable else {
+            selectedScriptState = .ready(Self.fallbackResult(fallback, reason: CompareAppError.dotnetNotFound.localizedDescription))
+            return
+        }
+
+        selectedScriptState = .generating("กำลังให้ DacFx ออก script สำหรับ \(includedKeys.count) object...")
+
+        let service = dacFxService
+        let workspace = report.workspace
+        let currentOptions = options
+
+        Task {
+            do {
+                let outcome = try await Task.detached(priority: .userInitiated) {
+                    try service.generateScript(
+                        workspace: workspace,
+                        options: currentOptions,
+                        includedObjectKeys: includedKeys,
+                        progress: { message in
+                            Task { @MainActor in
+                                guard token == self.scriptTaskToken else { return }
+                                self.selectedScriptState = .generating(message)
+                            }
+                        }
+                    )
+                }.value
+
+                guard token == scriptTaskToken else { return }
+                selectedScriptState = .ready(
+                    SelectedScriptResult(
+                        script: outcome.script,
+                        source: .dacFx,
+                        included: outcome.included,
+                        forcedIncluded: outcome.forcedIncluded,
+                        excludedCount: outcome.excludedCount,
+                        differenceCount: outcome.differenceCount,
+                        warnings: outcome.warnings,
+                        fallbackReason: nil,
+                        filter: nil
+                    )
+                )
+            } catch {
+                guard token == scriptTaskToken else { return }
+                selectedScriptState = .ready(Self.fallbackResult(fallback, reason: error.localizedDescription))
+            }
+        }
+    }
+
+    private static func fallbackResult(_ filter: DeploymentScriptFilterResult, reason: String) -> SelectedScriptResult {
+        SelectedScriptResult(
+            script: filter.script,
+            source: .textFilter,
+            included: [],
+            forcedIncluded: [],
+            excludedCount: filter.removedSectionCount,
+            differenceCount: filter.keptSectionCount + filter.removedSectionCount,
+            warnings: [],
+            fallbackReason: reason,
+            filter: filter
         )
     }
 
@@ -160,7 +291,7 @@ final class SchemaCompareViewModel: ObservableObject {
 
     // MARK: - Compare
 
-    func compareSchema(source: ConnectionInput, target: ConnectionInput, onSuccess: (() -> Void)? = nil) {
+    func compareSchema(source: SchemaCompareEndpoint, target: SchemaCompareEndpoint, onSuccess: (() -> Void)? = nil) {
         guard !isBusy else { return }
 
         guard options.hasSelectedCategory else {
@@ -181,6 +312,7 @@ final class SchemaCompareViewModel: ObservableObject {
             totalUnitCount: 3,
             showsIndeterminateSpinner: true
         )
+        discardScriptWork()
         report = nil
         selectedRowID = nil
         includedRowIDs = []
@@ -228,6 +360,7 @@ final class SchemaCompareViewModel: ObservableObject {
     }
 
     func clearReport() {
+        discardScriptWork()
         report = nil
         selectedRowID = nil
         includedRowIDs = []
@@ -238,6 +371,19 @@ final class SchemaCompareViewModel: ObservableObject {
         definitionState = .idle
         statusMessage = nil
         errorMessage = nil
+    }
+
+    /// หยุด helper ที่อาจกำลังรัน ลบ dacpac ของรอบก่อน และล้างสถานะ script กับ definition ที่อ่านจาก dacpac
+    private func discardScriptWork() {
+        scriptTaskToken += 1
+        definitionTaskToken += 1
+        dacFxService.cancel()
+        definitionService.cancel()
+        dacpacDefinitionsTask = nil
+        report?.workspace.cleanUp()
+        selectedScriptState = .idle
+        scriptSelection = nil
+        scriptFilter = nil
     }
 
     // MARK: - Filtering
@@ -252,12 +398,12 @@ final class SchemaCompareViewModel: ObservableObject {
 
     // MARK: - Definition detail
 
-    func select(row: SchemaCompareRow, source: ConnectionInput, target: ConnectionInput) {
+    func select(row: SchemaCompareRow, source: SchemaCompareEndpoint, target: SchemaCompareEndpoint) {
         selectedRowID = row.id
         loadDefinition(for: row.representative, source: source, target: target)
     }
 
-    private func selectFirstRow(source: ConnectionInput, target: ConnectionInput) {
+    private func selectFirstRow(source: SchemaCompareEndpoint, target: SchemaCompareEndpoint) {
         guard let first = filteredRows.first else { return }
         select(row: first, source: source, target: target)
     }
@@ -271,7 +417,9 @@ final class SchemaCompareViewModel: ObservableObject {
     }
 
     /// ดึง definition สองฝั่งมาเทียบ — object ที่มีฝั่งเดียวจะได้ `nil` อีกฝั่งซึ่งถูกต้องอยู่แล้ว
-    func loadDefinition(for difference: SchemaDifference, source: ConnectionInput, target: ConnectionInput) {
+    ///
+    /// ทั้งสองฝั่งเป็น database จะ query ผ่าน sqlcmd ถ้ามีฝั่งใดเป็นไฟล์ dacpac จะอ่านจาก dacpac ด้วย DacFx ทั้งคู่
+    func loadDefinition(for difference: SchemaDifference, source: SchemaCompareEndpoint, target: SchemaCompareEndpoint) {
         guard difference.category.supportsDefinitionDiff else {
             definitionState = .unsupported("object ชนิด \(difference.typeDisplay) ยังไม่รองรับการดู definition — ดูรายละเอียดได้จาก deployment script")
             return
@@ -279,20 +427,76 @@ final class SchemaCompareViewModel: ObservableObject {
 
         definitionTaskToken += 1
         let token = definitionTaskToken
-        let service = sqlCmdService
         definitionState = .loading
+
+        guard let sourceInput = source.connectionInput, let targetInput = target.connectionInput else {
+            loadDacpacDefinition(for: difference, token: token)
+            return
+        }
+
+        let service = sqlCmdService
 
         Task {
             do {
                 let definition = try await Task.detached(priority: .userInitiated) { () -> SchemaObjectDefinition in
-                    let sourceText = try service.loadObjectDefinition(source, difference: difference)
-                    let targetText = try service.loadObjectDefinition(target, difference: difference)
+                    let sourceText = try service.loadObjectDefinition(sourceInput, difference: difference)
+                    let targetText = try service.loadObjectDefinition(targetInput, difference: difference)
                     return SchemaDiffEngine.diff(sourceText: sourceText, targetText: targetText)
                 }.value
 
                 guard token == definitionTaskToken else { return }
                 definitionState = .loaded(definition)
             } catch {
+                guard token == definitionTaskToken else { return }
+                definitionState = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    /// อ่าน definition ของทุก object ที่ดูได้จาก dacpac ทั้งสองฝั่งในการรัน helper ครั้งแรก แล้วเก็บไว้ใช้กับแถวต่อ ๆ ไป
+    private func loadDacpacDefinition(for difference: SchemaDifference, token: Int) {
+        guard let report else {
+            definitionState = .idle
+            return
+        }
+
+        let definitionsTask: Task<[String: DacFxObjectDefinition], Error>
+        if let existing = dacpacDefinitionsTask {
+            definitionsTask = existing
+        } else {
+            let service = definitionService
+            let workspace = report.workspace
+            let keys = rows.filter { $0.category.supportsDefinitionDiff }.map { Self.objectKey(for: $0) }
+
+            definitionsTask = Task.detached(priority: .userInitiated) {
+                try service.loadDefinitions(workspace: workspace, objectKeys: keys)
+            }
+            dacpacDefinitionsTask = definitionsTask
+        }
+
+        let key = Self.objectKey(schemaName: difference.schemaName, objectName: difference.objectName)
+
+        Task {
+            do {
+                let definitions = try await definitionsTask.value
+                guard token == definitionTaskToken else { return }
+
+                guard let entry = definitions[key] else {
+                    definitionState = .unsupported("DacFx ไม่มี script ของ \(difference.plainName) ใน dacpac ทั้งสองฝั่ง — ดูรายละเอียดได้จาก deployment script")
+                    return
+                }
+
+                let definition = await Task.detached(priority: .userInitiated) {
+                    SchemaDiffEngine.diff(sourceText: entry.source, targetText: entry.target)
+                }.value
+
+                guard token == definitionTaskToken else { return }
+                definitionState = .loaded(definition)
+            } catch {
+                // ไม่เก็บรอบที่ล้มเหลวไว้ — คลิกแถวครั้งถัดไปจะรัน helper ใหม่
+                if dacpacDefinitionsTask == definitionsTask {
+                    dacpacDefinitionsTask = nil
+                }
                 guard token == definitionTaskToken else { return }
                 definitionState = .failed(error.localizedDescription)
             }
@@ -309,7 +513,7 @@ final class SchemaCompareViewModel: ObservableObject {
     }
 
     func saveScriptToFile() {
-        guard hasScript else { return }
+        guard canExportScript else { return }
 
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "domta-schema-\(Self.fileTimestamp()).sql"

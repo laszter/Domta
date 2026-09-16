@@ -8,6 +8,7 @@
 import AppKit
 import Combine
 import Foundation
+import UniformTypeIdentifiers
 
 @MainActor
 final class CompareViewModel: ObservableObject {
@@ -18,6 +19,11 @@ final class CompareViewModel: ObservableObject {
     @Published var targetConnectionString: String = ""
     @Published var sourcePassword: String = ""
     @Published var targetPassword: String = ""
+    /// schema compare เลือกแต่ละฝั่งเป็นไฟล์ dacpac ได้ — data compare ใช้ connection string เสมอ
+    @Published var sourceSchemaEndpointKind: SchemaEndpointKind = .database
+    @Published var targetSchemaEndpointKind: SchemaEndpointKind = .database
+    @Published var sourceDacpacPath: String = ""
+    @Published var targetDacpacPath: String = ""
     @Published var recentConnectionPairs: [RecentConnectionPair] = []
     @Published var comparableTables: [ComparableTable] = []
     @Published var selectedTableKeys: Set<String> = []
@@ -62,8 +68,60 @@ final class CompareViewModel: ObservableObject {
         ConnectionInput(connectionString: targetConnectionString, password: targetPassword)
     }
 
+    var sourceSchemaEndpoint: SchemaCompareEndpoint {
+        schemaEndpoint(kind: sourceSchemaEndpointKind, input: sourceInput, dacpacPath: sourceDacpacPath)
+    }
+
+    var targetSchemaEndpoint: SchemaCompareEndpoint {
+        schemaEndpoint(kind: targetSchemaEndpointKind, input: targetInput, dacpacPath: targetDacpacPath)
+    }
+
+    /// ทุกฝั่งที่ตั้งเป็น DACPAC File เลือกไฟล์แล้ว
+    var hasRequiredDacpacFiles: Bool {
+        (sourceSchemaEndpointKind == .database || !sourceDacpacPath.isEmpty)
+            && (targetSchemaEndpointKind == .database || !targetDacpacPath.isEmpty)
+    }
+
+    private func schemaEndpoint(kind: SchemaEndpointKind, input: ConnectionInput, dacpacPath: String) -> SchemaCompareEndpoint {
+        switch kind {
+        case .database: return .database(input)
+        case .dacpac: return .dacpac(URL(fileURLWithPath: dacpacPath))
+        }
+    }
+
+    func chooseSourceDacpac() {
+        if let path = chooseDacpac(side: "source", currentPath: sourceDacpacPath) {
+            sourceDacpacPath = path
+        }
+    }
+
+    func chooseTargetDacpac() {
+        if let path = chooseDacpac(side: "target", currentPath: targetDacpacPath) {
+            targetDacpacPath = path
+        }
+    }
+
+    private func chooseDacpac(side: String, currentPath: String) -> String? {
+        let panel = NSOpenPanel()
+        panel.message = "เลือกไฟล์ .dacpac สำหรับ \(side)"
+        panel.allowedContentTypes = [UTType(filenameExtension: "dacpac", conformingTo: .data) ?? .data]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+
+        if !currentPath.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: currentPath).deletingLastPathComponent()
+        }
+
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return url.path
+    }
+
     /// เก็บคู่ connection ปัจจุบันลง recent list — โหมด schema compare เรียกใช้ก่อนเริ่มงาน
+    ///
+    /// ข้ามเมื่อฝั่งใดเป็นไฟล์ dacpac เพราะ recent list เก็บได้แค่คู่ connection string
     func rememberCurrentConnectionPair() {
+        guard sourceSchemaEndpointKind == .database, targetSchemaEndpointKind == .database else { return }
         saveCurrentConnectionPair()
     }
 

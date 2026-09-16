@@ -91,7 +91,7 @@ nonisolated enum DeploymentScriptFilter {
     }
 
     /// แบ่ง script ตามบรรทัด `GO` โดยเก็บบรรทัด GO ไว้ท้าย batch เพื่อให้ต่อกลับได้เหมือนเดิม
-    private static func makeBatches(from script: String) -> [String] {
+    static func makeBatches(from script: String) -> [String] {
         let lines = script
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")

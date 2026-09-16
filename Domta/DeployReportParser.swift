@@ -127,3 +127,68 @@ private nonisolated final class ReportDelegate: NSObject, XMLParserDelegate {
         return String(elementName[elementName.index(after: separator)...])
     }
 }
+
+extension DeployReportParser {
+    /// ย้าย constraint ที่ report ระบุแค่ `[schema].[ConstraintName]` (FK / default / check) ไปเป็น object ลูก
+    /// ของ table แม่ โดยหา table จาก `ALTER TABLE` ใน deployment script ที่ sqlpackage ออกมาคู่กัน
+    ///
+    /// รายการที่หา table ไม่เจอคงไว้ตามเดิม — โผล่เป็นแถวของตัวเองในตารางเหมือนก่อน
+    static func resolvingParents(of differences: [SchemaDifference], script: String) -> [SchemaDifference] {
+        let owners = ConstraintOwnerIndex(script: script)
+        guard !owners.isEmpty else { return differences }
+
+        return differences.map { difference in
+            guard difference.isChildObjectType, !difference.isMember,
+                  let owner = owners.owner(ofConstraintInSchema: difference.schemaName, named: difference.objectName)
+            else { return difference }
+
+            return difference.rehomed(underSchema: owner.schema, table: owner.table)
+        }
+    }
+}
+
+/// ตาราง constraint → table แม่ ที่อ่านจาก `ALTER TABLE ... ADD|DROP CONSTRAINT` ใน deployment script
+///
+/// ชื่อ constraint ไม่ซ้ำกันภายใน schema (SQL Server เก็บเป็น schema-scoped object)
+/// จึงใช้ `schema.constraint` ชี้ table ได้ตัวเดียว
+nonisolated struct ConstraintOwnerIndex {
+    struct Owner: Equatable {
+        let schema: String
+        let table: String
+    }
+
+    private var owners: [String: Owner] = [:]
+
+    /// `ALTER TABLE [s].[t] [WITH CHECK|NOCHECK] ADD|DROP|CHECK|NOCHECK CONSTRAINT [name]` — ชื่อในวงเล็บรองรับ `]]`
+    private static let pattern =
+        #"ALTER\s+TABLE\s+\[((?:[^\]]|\]\])+)\]\.\[((?:[^\]]|\]\])+)\]\s+(?:WITH\s+(?:NO)?CHECK\s+)?(?:ADD|DROP|CHECK|NOCHECK)\s+CONSTRAINT\s+\[((?:[^\]]|\]\])+)\]"#
+
+    init(script: String) {
+        guard !script.isEmpty,
+              let regex = try? NSRegularExpression(pattern: Self.pattern, options: [.caseInsensitive]) else { return }
+
+        let range = NSRange(script.startIndex..., in: script)
+        for match in regex.matches(in: script, options: [], range: range) {
+            guard let schema = Self.capture(1, in: match, of: script),
+                  let table = Self.capture(2, in: match, of: script),
+                  let constraint = Self.capture(3, in: match, of: script) else { continue }
+
+            owners[Self.key(schema: schema, name: constraint)] = Owner(schema: schema, table: table)
+        }
+    }
+
+    var isEmpty: Bool { owners.isEmpty }
+
+    func owner(ofConstraintInSchema schema: String, named name: String) -> Owner? {
+        owners[Self.key(schema: schema, name: name)]
+    }
+
+    private static func key(schema: String, name: String) -> String {
+        "\(schema.lowercased()).\(name.lowercased())"
+    }
+
+    private static func capture(_ index: Int, in match: NSTextCheckingResult, of text: String) -> String? {
+        guard let range = Range(match.range(at: index), in: text) else { return nil }
+        return String(text[range]).replacingOccurrences(of: "]]", with: "]")
+    }
+}

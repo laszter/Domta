@@ -11,8 +11,8 @@ import SwiftUI
 /// และล่างคือ Comparison Details ที่แสดง definition ของทั้งสองฝั่งเทียบกัน
 struct SchemaCompareView: View {
     @ObservedObject var viewModel: SchemaCompareViewModel
-    let source: ConnectionInput
-    let target: ConnectionInput
+    let source: SchemaCompareEndpoint
+    let target: SchemaCompareEndpoint
     let onEditConnections: () -> Void
     let onShowScript: () -> Void
 
@@ -57,21 +57,21 @@ struct SchemaCompareView: View {
     private var toolbar: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .bottom, spacing: 10) {
-                connectionField(title: "Source", value: sourceLabel, tint: .green)
+                connectionField(title: "Source", endpoint: source, value: sourceLabel, tint: .green)
 
                 Button("...") {
                     onEditConnections()
                 }
                 .buttonStyle(.bordered)
-                .help("กลับไปแก้ connection string")
+                .help("กลับไปแก้ connection string หรือเลือกไฟล์ dacpac")
 
-                connectionField(title: "Target", value: targetLabel, tint: .red)
+                connectionField(title: "Target", endpoint: target, value: targetLabel, tint: .red)
 
                 Button("...") {
                     onEditConnections()
                 }
                 .buttonStyle(.bordered)
-                .help("กลับไปแก้ connection string")
+                .help("กลับไปแก้ connection string หรือเลือกไฟล์ dacpac")
 
                 Button("Options") {
                     isShowingOptions.toggle()
@@ -99,6 +99,10 @@ struct SchemaCompareView: View {
                     Label("ไม่พบ sqlpackage — `dotnet tool install --global microsoft.sqlpackage`", systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
                         .foregroundStyle(.orange)
+                } else if !viewModel.isDotnetAvailable {
+                    Label("ไม่พบ dotnet (.NET SDK 10+) — script ของ object ที่เลือกจะใช้ตัวตัดแบบข้อความซึ่งไม่รู้ dependency", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 } else if let statusMessage = viewModel.statusMessage {
                     Text(statusMessage)
                         .font(.caption)
@@ -119,16 +123,21 @@ struct SchemaCompareView: View {
         }
     }
 
-    private func connectionField(title: String, value: String, tint: Color) -> some View {
+    private func connectionField(title: String, endpoint: SchemaCompareEndpoint, value: String, tint: Color) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
 
-            Text(value)
-                .font(.system(.subheadline, design: .monospaced))
-                .lineLimit(1)
-                .truncationMode(.middle)
+            HStack(spacing: 6) {
+                Image(systemName: endpoint.kind.systemImage)
+                    .foregroundStyle(.secondary)
+
+                Text(value)
+                    .font(.system(.subheadline, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)
@@ -140,6 +149,7 @@ struct SchemaCompareView: View {
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(tint.opacity(0.35), lineWidth: 1)
                 }
+                .help(Self.endpointHelp(for: endpoint, label: value))
         }
         .frame(maxWidth: .infinity)
     }
@@ -180,8 +190,26 @@ struct SchemaCompareView: View {
         .frame(width: 380, alignment: .leading)
     }
 
-    private var sourceLabel: String { Self.databaseLabel(for: source, fallback: "Source") }
-    private var targetLabel: String { Self.databaseLabel(for: target, fallback: "Target") }
+    private var sourceLabel: String { Self.endpointLabel(for: source, fallback: "Source") }
+    private var targetLabel: String { Self.endpointLabel(for: target, fallback: "Target") }
+
+    /// ฝั่งใดเป็นไฟล์ dacpac → definition มาจาก DacFx ซึ่งรอบแรกช้ากว่า sqlcmd
+    private var usesDacpacDefinitions: Bool {
+        source.connectionInput == nil || target.connectionInput == nil
+    }
+
+    private static func endpointLabel(for endpoint: SchemaCompareEndpoint, fallback: String) -> String {
+        switch endpoint {
+        case .database(let input): return databaseLabel(for: input, fallback: fallback)
+        case .dacpac(let url): return url.lastPathComponent
+        }
+    }
+
+    /// tooltip ของช่อง source / target — ไฟล์ dacpac แสดง path เต็ม
+    private static func endpointHelp(for endpoint: SchemaCompareEndpoint, label: String) -> String {
+        if case .dacpac(let url) = endpoint { return url.path }
+        return label
+    }
 
     private static func databaseLabel(for input: ConnectionInput, fallback: String) -> String {
         guard let configuration = try? ConnectionStringParser.parse(input.connectionString) else { return fallback }
@@ -250,7 +278,7 @@ struct SchemaCompareView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("ยังไม่มีผล schema compare")
                 .font(.headline)
-            Text("กด Compare เพื่อให้ sqlpackage extract schema ของ source ออกมาเป็น dacpac แล้วเทียบกับ target")
+            Text("กด Compare เพื่อให้ sqlpackage extract schema ของฝั่งที่เป็น database ออกมาเป็น dacpac (ฝั่งที่เลือกไฟล์ .dacpac ใช้ไฟล์นั้นตรง ๆ) แล้วเทียบกัน")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
@@ -361,6 +389,7 @@ struct SchemaCompareView: View {
     private var gridHeader: some View {
         HStack(spacing: 0) {
             headerCell("Type", width: Layout.typeWidth)
+                .help("ชนิด object ตามที่ sqlpackage รายงาน (Table, View, Procedure, ...) — index และ constraint ถูกยุบเข้าแถวของ table แม่ ดูรายละเอียดได้ใน Comparison Details")
             headerCell("Source Name", width: Layout.nameWidth)
 
             Button {
@@ -506,7 +535,9 @@ struct SchemaCompareView: View {
         case .loading:
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("กำลังอ่าน definition จากทั้งสองฝั่ง...")
+                Text(usesDacpacDefinitions
+                     ? "กำลังให้ DacFx อ่าน definition จาก dacpac ทั้งสองฝั่ง (ครั้งแรกใช้เวลาสักครู่)..."
+                     : "กำลังอ่าน definition จากทั้งสองฝั่ง...")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -711,7 +742,7 @@ struct SchemaScriptView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Deployment Script")
                         .font(.title2.weight(.semibold))
-                    Text("script นี้มาจาก `sqlpackage /Action:Script` — รันบน target เพื่อทำให้ schema เท่ากับ source")
+                    Text("รันบน target เพื่อทำให้ schema เท่ากับ source — object ที่เลือกออกโดย DacFx พร้อม dependency ที่จำเป็น")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -722,20 +753,26 @@ struct SchemaScriptView: View {
                     viewModel.copyScriptToPasteboard()
                 }
                 .buttonStyle(.bordered)
-                .disabled(!viewModel.hasScript)
+                .disabled(!viewModel.canExportScript)
 
                 Button("Save as .sql") {
                     viewModel.saveScriptToFile()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!viewModel.hasScript)
+                .disabled(!viewModel.canExportScript)
             }
 
-            scopePicker
-
-            if let filter = viewModel.scriptFilter {
-                filterSummary(filter)
+            HStack(spacing: 16) {
+                scopePicker
+                formatPicker
+                Spacer()
             }
+
+            Text(viewModel.scriptFormat.help)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            statusArea
 
             Label("ตรวจ script ให้ครบก่อนรันจริง โดยเฉพาะส่วน DROP และ ALTER TABLE ที่อาจทำให้ข้อมูลหาย", systemImage: "exclamationmark.triangle")
                 .font(.caption)
@@ -749,6 +786,12 @@ struct SchemaScriptView: View {
                 .background {
                     RoundedRectangle(cornerRadius: 12)
                         .fill(Color(nsColor: .textBackgroundColor))
+                }
+                .overlay {
+                    if viewModel.selectedScriptState.isGenerating, !viewModel.showsFullScript {
+                        ProgressView()
+                            .controlSize(.large)
+                    }
                 }
         }
         .padding(24)
@@ -766,8 +809,19 @@ struct SchemaScriptView: View {
         .frame(width: 420)
     }
 
+    private var formatPicker: some View {
+        Picker("Format", selection: $viewModel.scriptFormat) {
+            ForEach(SchemaScriptFormat.allCases) { format in
+                Text(format.title).tag(format)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(width: 240)
+    }
+
     @ViewBuilder
-    private func filterSummary(_ filter: DeploymentScriptFilterResult) -> some View {
+    private var statusArea: some View {
         if viewModel.showsFullScript {
             Label(
                 "script เต็มจาก sqlpackage — ครอบคลุมทุก object ในกลุ่มที่เปิดไว้ใน Options",
@@ -776,32 +830,74 @@ struct SchemaScriptView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
         } else {
-            VStack(alignment: .leading, spacing: 4) {
-                Label(
-                    filter.didFilterAnything
-                        ? "ตัด \(filter.removedSectionCount) ส่วนที่เป็นของ object ที่ไม่ได้ติ๊กออกแล้ว เหลือ \(filter.keptSectionCount) ส่วน"
-                        : "ทุก object ในตารางถูกติ๊กไว้ script จึงเท่ากับ script เต็ม",
-                    systemImage: "line.3.horizontal.decrease.circle"
-                )
-                .foregroundStyle(.secondary)
+            switch viewModel.selectedScriptState {
+            case .idle:
+                EmptyView()
 
-                if filter.unattributedSectionCount > 0 {
+            case .generating(let message):
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+            case .ready(let result):
+                selectedSummary(result)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func selectedSummary(_ result: SelectedScriptResult) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if result.usedFallback {
+                Label(
+                    "DacFx helper ใช้ไม่ได้ จึงตัด script เต็มแบบข้อความแทน — script นี้อาจรันไม่ผ่านถ้า object ที่เลือกพึ่ง object ที่ตัดออก",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .foregroundStyle(.orange)
+
+                if let reason = result.fallbackReason {
+                    Text(reason)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(4)
+                }
+
+                if let filter = result.filter {
                     Label(
-                        "เก็บอีก \(filter.unattributedSectionCount) ส่วนที่ระบุไม่ได้ว่าเป็นของ object ไหนไว้ทั้งหมด (preamble, SET options และท้าย script)",
-                        systemImage: "shield.lefthalf.filled"
+                        filter.didFilterAnything
+                            ? "ตัด \(filter.removedSectionCount) ส่วนที่เป็นของ object ที่ไม่ได้ติ๊กออก เหลือ \(filter.keptSectionCount) ส่วน"
+                            : "ทุก object ถูกติ๊กไว้ script จึงเท่ากับ script เต็ม",
+                        systemImage: "line.3.horizontal.decrease.circle"
                     )
                     .foregroundStyle(.secondary)
                 }
+            } else {
+                Label(
+                    "DacFx เก็บ \(result.included.count) object จาก \(result.differenceCount) ความต่าง (ตัดออก \(result.excludedCount)) — dependency ที่ object เหล่านี้ต้องใช้ เช่น FK ของตารางอื่น ถูกใส่ไว้ให้แล้ว",
+                    systemImage: "checkmark.shield"
+                )
+                .foregroundStyle(.secondary)
 
-                if filter.didFilterAnything {
+                if !result.forcedIncluded.isEmpty {
                     Label(
-                        "ถ้า object ที่เก็บไว้อ้างถึง object ที่ตัดออก script จะรันไม่ผ่าน — ตรวจ dependency ก่อนรัน",
-                        systemImage: "exclamationmark.triangle"
+                        "เก็บเพิ่ม \(result.forcedIncluded.count) object ที่ไม่ได้ติ๊ก เพราะ object ที่ติ๊กต้องพึ่ง: "
+                            + result.forcedIncluded.map { "\($0.key) (\($0.action))" }.joined(separator: ", "),
+                        systemImage: "link"
                     )
                     .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                }
+
+                ForEach(result.warnings, id: \.self) { warning in
+                    Label(warning, systemImage: "info.circle")
+                        .foregroundStyle(.secondary)
                 }
             }
-            .font(.caption)
         }
+        .font(.caption)
     }
 }
