@@ -5,10 +5,7 @@
 
 import SwiftUI
 
-/// หน้า schema compare ที่จัดวางตาม Schema Compare ของ mssql extension
-///
-/// แถบบนคือ source / target และปุ่ม Compare, กลางคือตารางความต่างที่ติ๊กเลือกได้
-/// และล่างคือ Comparison Details ที่แสดง definition ของทั้งสองฝั่งเทียบกัน
+/// Compare results share the logo palette and controls used by Connections.
 struct SchemaCompareView: View {
     @ObservedObject var viewModel: SchemaCompareViewModel
     let source: SchemaCompareEndpoint
@@ -16,142 +13,181 @@ struct SchemaCompareView: View {
     let onEditConnections: () -> Void
     let onShowScript: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
     @State private var isShowingOptions = false
-    @State private var splitRatio: CGFloat = 0.42
+    @State private var isShowingAlerts = false
+    @State private var isShowingErrorDetails = false
+    @State private var showsMemberDetails = false
+    @State private var splitRatio: CGFloat = 0.43
     @State private var dragStartTopHeight: CGFloat?
 
-    private enum Layout {
-        static let typeWidth: CGFloat = 130
-        static let nameWidth: CGFloat = 360
-        static let checkWidth: CGFloat = 44
-        static let actionWidth: CGFloat = 110
-    }
+    private var accent: Color { DomtaTheme.accent(colorScheme) }
+    private var muted: Color { DomtaTheme.placeholder(colorScheme) }
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 16) {
             toolbar
-
-            if viewModel.isBusy {
-                busyBanner
-            }
-
-            if let errorMessage = viewModel.errorMessage {
-                errorBanner(errorMessage)
-            }
-
+            if viewModel.isBusy { busyBanner }
+            if let error = viewModel.errorMessage { errorBanner(error) }
             if viewModel.report == nil {
                 emptyState
-                Spacer(minLength: 0)
             } else {
-                splitContent
+                resultsToolbar
+                if viewModel.rows.isEmpty { differenceGrid } else { splitContent }
             }
         }
-        .padding(20)
+        .padding(24)
         .frame(minWidth: 1180, minHeight: 860)
-        .background(DomtaPageBackground())
+        .background(DomtaTheme.canvas(colorScheme))
+        .tint(accent)
         .navigationTitle("Schema Compare")
+        .toolbarBackground(DomtaTheme.canvas(colorScheme), for: .windowToolbar)
+        .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
+        .onChange(of: viewModel.selectedRowID) { showsMemberDetails = false }
+        .onChange(of: viewModel.filteredRows.map(\.id)) { _, visibleIDs in
+            if let id = viewModel.selectedRowID, !visibleIDs.contains(id) {
+                viewModel.selectedRowID = nil
+            }
+        }
     }
 
-    // MARK: - Toolbar
-
     private var toolbar: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .bottom, spacing: 10) {
-                connectionField(title: "Source", endpoint: source, value: sourceLabel, tint: .green)
-
-                Button("...") {
-                    onEditConnections()
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
+                Image("DomtaLogo")
+                    .resizable().interpolation(.none).scaledToFit()
+                    .frame(width: 40, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Schema Compare").font(.system(size: 24, weight: .semibold)).tracking(-0.5)
+                    Text("ตรวจความต่าง แล้วเลือกสิ่งที่จะปรับบน Target ให้ตรงกับ Source")
+                        .font(.system(size: 12)).foregroundStyle(muted)
                 }
-                .buttonStyle(.bordered)
-                .help("กลับไปแก้ connection string หรือเลือกไฟล์ dacpac")
-
-                connectionField(title: "Target", endpoint: target, value: targetLabel, tint: .red)
-
-                Button("...") {
-                    onEditConnections()
-                }
-                .buttonStyle(.bordered)
-                .help("กลับไปแก้ connection string หรือเลือกไฟล์ dacpac")
-
-                Button("Options") {
-                    isShowingOptions.toggle()
-                }
-                .buttonStyle(.bordered)
-                .popover(isPresented: $isShowingOptions, arrowEdge: .bottom) {
-                    optionsPopover
-                }
-
-                Button(viewModel.isBusy ? "Comparing..." : "Compare") {
-                    viewModel.compareSchema(source: source, target: target)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(viewModel.isBusy || !viewModel.isSqlPackageAvailable)
-
-                Button("Generate Script") {
-                    onShowScript()
-                }
-                .buttonStyle(.bordered)
-                .disabled(!viewModel.hasScript)
-            }
-
-            HStack(spacing: 10) {
-                if !viewModel.isSqlPackageAvailable {
-                    Label("ไม่พบ sqlpackage — `dotnet tool install --global microsoft.sqlpackage`", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                } else if !viewModel.isDotnetAvailable {
-                    Label("ไม่พบ dotnet (.NET SDK 10+) — script ของ object ที่เลือกจะใช้ตัวตัดแบบข้อความซึ่งไม่รู้ dependency", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                } else if let statusMessage = viewModel.statusMessage {
-                    Text(statusMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
                 Spacer()
-
-                if viewModel.report != nil {
-                    Text("\(viewModel.includedRowIDs.count) / \(viewModel.rows.count) selected")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    DomtaSearchField(prompt: "ค้นหา object", text: $viewModel.searchText)
-                        .frame(width: 240)
+                Button { isShowingOptions.toggle() } label: {
+                    Label("Options", systemImage: "slider.horizontal.3")
                 }
+                .buttonStyle(.bordered).controlSize(.large)
+                .disabled(viewModel.isBusy)
+                .popover(isPresented: $isShowingOptions, arrowEdge: .bottom) { optionsPopover }
+                Button {
+                    viewModel.compareSchema(source: source, target: target)
+                } label: {
+                    Label(viewModel.report == nil ? "Compare" : "Compare Again", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(DomtaPrimaryButtonStyle())
+                .disabled(viewModel.isBusy || !viewModel.isSqlPackageAvailable)
+            }
+            HStack(spacing: 18) {
+                connectionField(title: "Source", endpoint: source, value: sourceLabel, tint: DomtaTheme.source(colorScheme))
+                Image(systemName: "arrow.right").foregroundStyle(muted).accessibilityHidden(true)
+                connectionField(title: "Target", endpoint: target, value: targetLabel, tint: DomtaTheme.target(colorScheme))
+                Button { onEditConnections() } label: {
+                    Label("Edit Connections", systemImage: "pencil")
+                }
+                .buttonStyle(.bordered).disabled(viewModel.isBusy)
+            }
+            .padding(14)
+            .background(DomtaTheme.sidebar(colorScheme), in: RoundedRectangle(cornerRadius: 6))
+            if !viewModel.isSqlPackageAvailable {
+                Label("ไม่พบ sqlpackage — ติดตั้งด้วย dotnet tool install --global microsoft.sqlpackage", systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 12)).foregroundStyle(DomtaTheme.target(colorScheme)).textSelection(.enabled)
+            } else if !viewModel.isDotnetAvailable {
+                Label("ไม่พบ .NET SDK 10+ — การสร้าง script เฉพาะที่เลือกจะตรวจ dependency ได้จำกัด", systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 12)).foregroundStyle(DomtaTheme.target(colorScheme))
             }
         }
     }
 
     private func connectionField(title: String, endpoint: SchemaCompareEndpoint, value: String, tint: Color) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
-
-            HStack(spacing: 6) {
-                Image(systemName: endpoint.kind.systemImage)
-                    .foregroundStyle(.secondary)
-
+        HStack(spacing: 10) {
+            Image(systemName: endpoint.kind.systemImage)
+                .font(.system(size: 18)).foregroundStyle(tint)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(title).fontWeight(.semibold).foregroundStyle(tint)
+                    Text("· " + (title == "Source" ? "ข้อมูลอ้างอิง" : "ปลายทางที่จะปรับ"))
+                        .foregroundStyle(DomtaTheme.sidebarMuted(colorScheme))
+                }.font(.system(size: 11))
                 Text(value)
-                    .font(.system(.subheadline, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .font(.system(size: 13, weight: .medium, design: .monospaced))
+                    .foregroundStyle(DomtaTheme.sidebarInk(colorScheme))
+                    .lineLimit(1).truncationMode(.middle)
             }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color(nsColor: .textBackgroundColor))
-                }
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(tint.opacity(0.35), lineWidth: 1)
-                }
-                .help(Self.endpointHelp(for: endpoint, label: value))
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(Self.endpointHelp(for: endpoint, label: value))
+    }
+
+    private var resultsToolbar: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Text("Differences").font(.system(size: 17, weight: .semibold))
+                Text("\(viewModel.rows.count) objects").font(.system(size: 12)).foregroundStyle(muted)
+                if let report = viewModel.report, !report.alerts.isEmpty {
+                    Button { isShowingAlerts.toggle() } label: {
+                        Label("Alerts (\(report.alerts.count))", systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(DomtaTheme.target(colorScheme))
+                    }
+                    .buttonStyle(.bordered)
+                    .popover(isPresented: $isShowingAlerts) {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 16) {
+                                ForEach(report.alerts) { alert in
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text(alert.title).font(.headline)
+                                        ForEach(Array(alert.issues.enumerated()), id: \.offset) { _, issue in
+                                            Text(issue).font(.callout).textSelection(.enabled)
+                                        }
+                                    }
+                                }
+                            }.padding(20)
+                        }.frame(width: 440, height: 320)
+                    }
+                }
+                Spacer()
+                Text("\(viewModel.includedRowIDs.count) selected for script")
+                    .font(.system(size: 12)).foregroundStyle(muted)
+                Button(action: onShowScript) {
+                    Label("Review Script", systemImage: "chevron.left.forwardslash.chevron.right")
+                }
+                .buttonStyle(DomtaPrimaryButtonStyle())
+                .disabled(!viewModel.hasScript || !viewModel.hasIncludedRows || viewModel.isBusy)
+            }
+            HStack(spacing: 12) {
+                DomtaSearchField(prompt: "ค้นหาชื่อ object หรือประเภท", text: $viewModel.searchText)
+                    .frame(width: 280)
+                Picker("Type", selection: $viewModel.categoryFilter) {
+                    Text("All types").tag(SchemaObjectCategory?.none)
+                    ForEach(viewModel.populatedCategories) { category in
+                        Text("\(category.title) (\(viewModel.count(for: category)))").tag(Optional(category))
+                    }
+                }.frame(width: 220)
+                Picker("Action", selection: $viewModel.kindFilter) {
+                    Text("All actions").tag(SchemaChangeKind?.none)
+                    ForEach(SchemaChangeKind.allCases.filter { viewModel.count(for: $0) > 0 }) { kind in
+                        Text("\(kind.actionTitle) (\(viewModel.count(for: kind)))").tag(Optional(kind))
+                    }
+                }.frame(width: 215)
+                if hasFilters {
+                    Button("Clear Filters", action: clearFilters).buttonStyle(.borderless)
+                }
+                Spacer(minLength: 0)
+                Text("\(viewModel.filteredRows.count) shown").font(.system(size: 11)).foregroundStyle(muted)
+            }
+            .controlSize(.regular)
+        }
+    }
+
+    private var hasFilters: Bool {
+        !viewModel.searchText.isEmpty || viewModel.categoryFilter != nil || viewModel.kindFilter != nil
+    }
+
+    private func clearFilters() {
+        viewModel.searchText = ""
+        viewModel.categoryFilter = nil
+        viewModel.kindFilter = nil
     }
 
     private var optionsPopover: some View {
@@ -166,7 +202,7 @@ struct SchemaCompareView: View {
                 ))
             }
 
-            Text("กลุ่มที่ไม่ติ๊กจะถูกส่งเป็น `/p:ExcludeObjectTypes` ให้ sqlpackage — ไม่โผล่ทั้งในตารางและใน script")
+            Text("เลือกประเภทที่จะนำมาเปรียบเทียบ ประเภทที่ไม่เลือกจะไม่รวมในผลและ script ใช้กับการ Compare ครั้งถัดไป")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(width: 340, alignment: .leading)
@@ -177,7 +213,7 @@ struct SchemaCompareView: View {
             Text("Compare Behavior")
                 .font(.subheadline.weight(.semibold))
 
-            Toggle("แสดง object ที่มีเฉพาะฝั่ง target (DropObjectsNotInSource)", isOn: $viewModel.options.reportObjectsOnlyInTarget)
+            Toggle("รวม object ที่มีเฉพาะ Target (เสนอให้ลบ)", isOn: $viewModel.options.reportObjectsOnlyInTarget)
             Toggle("ข้าม whitespace และ comment", isOn: $viewModel.options.ignoreWhitespaceInModules)
             Toggle("ข้าม permission", isOn: $viewModel.options.ignorePermissions)
             Toggle("ข้าม user / role setting", isOn: $viewModel.options.ignoreUserSettingsObjects)
@@ -253,41 +289,46 @@ struct SchemaCompareView: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: 6)
                 .fill(Color.accentColor.opacity(0.10))
         }
     }
 
     private func errorBanner(_ message: String) -> some View {
-        ScrollView {
-            Text(message)
-                .font(.callout)
-                .foregroundStyle(.red)
-                .textSelection(.enabled)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.circle.fill")
+            Text(message).lineLimit(2).textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Details") { isShowingErrorDetails = true }
+                .buttonStyle(.bordered)
+                .popover(isPresented: $isShowingErrorDetails) {
+                    ScrollView {
+                        Text(message).font(.callout).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(20)
+                    }.frame(width: 560, height: 300)
+                }
         }
-        .frame(maxHeight: 140)
+        .font(.system(size: 12))
+        .foregroundStyle(DomtaTheme.target(colorScheme))
         .padding(12)
-        .background {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.red.opacity(0.08))
-        }
+        .background(DomtaTheme.target(colorScheme).opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
     }
 
     private var emptyState: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("ยังไม่มีผล schema compare")
-                .font(.headline)
-            Text("กด Compare เพื่อให้ sqlpackage extract schema ของฝั่งที่เป็น database ออกมาเป็น dacpac (ฝั่งที่เลือกไฟล์ .dacpac ใช้ไฟล์นั้นตรง ๆ) แล้วเทียบกัน")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+        VStack(spacing: 16) {
+            Image(systemName: viewModel.isBusy ? "square.stack.3d.up" : "doc.text.magnifyingglass")
+                .font(.system(size: 38, weight: .light)).foregroundStyle(accent)
+            Text(viewModel.isBusy ? "กำลังตรวจความต่างของ schema" : (viewModel.errorMessage == nil ? "พร้อมตรวจความต่างของ schema" : "ยังเปรียบเทียบไม่สำเร็จ"))
+                .font(.system(size: 21, weight: .semibold))
+            Text(viewModel.isBusy
+                 ? "ผลจะแสดงเป็นรายการ object พร้อมสิ่งที่จะเปลี่ยนบน Target"
+                 : "กด Compare เพื่อดู object ที่เพิ่ม เปลี่ยน หรือลบ\nจากนั้นเลือกแต่ละรายการเพื่ออ่าน definition เทียบกัน")
+                .font(.system(size: 13)).foregroundStyle(muted)
+                .multilineTextAlignment(.center).lineSpacing(5)
+            Label("ขั้นตอนนี้ยังไม่แก้ไขฐานข้อมูล", systemImage: "checkmark.shield")
+                .font(.system(size: 12)).foregroundStyle(muted).padding(.top, 8)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(18)
-        .background {
-            RoundedRectangle(cornerRadius: 14)
-                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.7))
-        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - Split layout
@@ -295,8 +336,8 @@ struct SchemaCompareView: View {
     private var splitContent: some View {
         GeometryReader { geometry in
             let dividerHeight: CGFloat = 12
-            let minTopHeight: CGFloat = 150
-            let minBottomHeight: CGFloat = 220
+            let minTopHeight: CGFloat = 210
+            let minBottomHeight: CGFloat = 280
             let totalHeight = max(geometry.size.height, minTopHeight + minBottomHeight + dividerHeight)
             let availableHeight = totalHeight - dividerHeight
             let maxTopHeight = max(minTopHeight, availableHeight - minBottomHeight)
@@ -336,6 +377,16 @@ struct SchemaCompareView: View {
                     .frame(width: 68, height: 4)
             }
             .contentShape(Rectangle())
+            .help("ลากเพื่อปรับพื้นที่รายการและรายละเอียด")
+            .accessibilityElement()
+            .accessibilityLabel("Resize comparison panels")
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: splitRatio = min(0.8, splitRatio + 0.05)
+                case .decrement: splitRatio = max(0.2, splitRatio - 0.05)
+                @unknown default: break
+                }
+            }
             .onHover { isHovering in
                 if isHovering { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
             }
@@ -353,210 +404,161 @@ struct SchemaCompareView: View {
             )
     }
 
-    // MARK: - Difference grid
+    // MARK: - Difference list
+
+    private var rowSelection: Binding<SchemaCompareRow.ID?> {
+        Binding<SchemaCompareRow.ID?>(
+            get: { viewModel.selectedRowID },
+            set: { id in
+                guard let id else { viewModel.selectedRowID = nil; return }
+                guard let row = viewModel.rows.first(where: { $0.id == id }) else { return }
+                viewModel.select(row: row, source: source, target: target)
+            }
+        )
+    }
 
     private var differenceGrid: some View {
         VStack(spacing: 0) {
-            gridHeader
-
-            if viewModel.filteredRows.isEmpty {
-                Text(viewModel.rows.isEmpty
-                     ? "schema ทั้งสองฝั่งตรงกันแล้ว ไม่พบความต่าง"
-                     : "ไม่พบ object ที่ตรงกับคำค้นหา")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView([.horizontal, .vertical]) {
-                    LazyVStack(spacing: 0) {
-                        ForEach(viewModel.filteredRows) { row in
-                            gridRow(row)
-                        }
-                    }
+            if !viewModel.rows.isEmpty {
+                HStack(spacing: 10) {
+                    Toggle("Select visible", isOn: Binding(
+                        get: { viewModel.areAllVisibleRowsIncluded },
+                        set: { viewModel.setInclusionForVisibleRows($0) }
+                    ))
+                    .toggleStyle(.checkbox).disabled(viewModel.filteredRows.isEmpty)
+                    Text("เลือกแถวเพื่อดูรายละเอียด · ติ๊กเพื่อรวมใน script")
+                        .foregroundStyle(muted)
+                    Spacer()
                 }
+                .font(.system(size: 11)).padding(.horizontal, 12).padding(.vertical, 10)
+                .background(DomtaTheme.rule(colorScheme).opacity(0.2))
+            }
+            if viewModel.filteredRows.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: viewModel.rows.isEmpty ? "checkmark.circle" : "magnifyingglass")
+                        .font(.system(size: 24)).foregroundStyle(accent)
+                    Text(viewModel.rows.isEmpty ? "ไม่พบความต่างในขอบเขตที่เลือก" : "ไม่พบ object ที่ตรงกับตัวกรอง")
+                        .font(.system(size: 13, weight: .medium))
+                    if viewModel.rows.isEmpty {
+                        Text("Source และ Target ตรงกันสำหรับประเภทและตัวเลือกที่ใช้เปรียบเทียบ")
+                            .font(.system(size: 12)).foregroundStyle(muted)
+                    }
+                    if hasFilters { Button("Clear Filters", action: clearFilters).buttonStyle(.borderless) }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                Table(viewModel.filteredRows, selection: rowSelection) {
+                    SwiftUI.TableColumn("Script") { row in
+                        Toggle("Include \(row.plainName) in script", isOn: Binding(
+                            get: { viewModel.includedRowIDs.contains(row.id) },
+                            set: { included in
+                                if included != viewModel.includedRowIDs.contains(row.id) { viewModel.toggleInclusion(row) }
+                            }
+                        )).toggleStyle(.checkbox).labelsHidden()
+                    }.width(48)
+                    SwiftUI.TableColumn("Object") { row in
+                        Label(row.plainName, systemImage: row.category.systemImage)
+                            .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            .lineLimit(1).truncationMode(.middle).help(row.plainName)
+                            .padding(.vertical, 5)
+                    }.width(min: 240, ideal: 400)
+                    SwiftUI.TableColumn("Type") { row in
+                        Text(row.typeDisplay).font(.system(size: 12))
+                    }.width(min: 90, ideal: 120, max: 160)
+                    SwiftUI.TableColumn("Action on Target") { row in
+                        SchemaActionBadge(kind: row.kind)
+                    }.width(150)
+                    SwiftUI.TableColumn("Difference") { row in
+                        Text(row.kind.title).font(.system(size: 12))
+                            .help(row.memberSummaryLines.joined(separator: "\n"))
+                    }.width(min: 130, ideal: 190, max: 230)
+                }
+                .tableStyle(.inset)
+                .scrollContentBackground(.hidden)
+                .alternatingRowBackgrounds(.disabled)
+                .accessibilityLabel("Schema differences")
             }
         }
-        .background {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-        }
-    }
-
-    private var gridHeader: some View {
-        HStack(spacing: 0) {
-            headerCell("Type", width: Layout.typeWidth)
-                .help("ชนิด object ตามที่ sqlpackage รายงาน (Table, View, Procedure, ...) — index และ constraint ถูกยุบเข้าแถวของ table แม่ ดูรายละเอียดได้ใน Comparison Details")
-            headerCell("Source Name", width: Layout.nameWidth)
-
-            Button {
-                viewModel.setInclusionForVisibleRows(!viewModel.areAllVisibleRowsIncluded)
-            } label: {
-                Image(systemName: viewModel.areAllVisibleRowsIncluded ? "checkmark.square.fill" : "square")
-                    .foregroundStyle(viewModel.areAllVisibleRowsIncluded ? Color.accentColor : Color.secondary)
-                    .frame(width: Layout.checkWidth)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("ติ๊ก/เอาออกทุกแถวที่แสดงอยู่")
-
-            headerCell("Action", width: Layout.actionWidth)
-            headerCell("Target Name", width: Layout.nameWidth)
-        }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 10)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color.primary.opacity(0.10))
-                .frame(height: 0.5)
-        }
-    }
-
-    private func headerCell(_ text: String, width: CGFloat) -> some View {
-        Text(text)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.secondary)
-            .frame(width: width, alignment: .leading)
-    }
-
-    private func gridRow(_ row: SchemaCompareRow) -> some View {
-        let isSelected = viewModel.selectedRowID == row.id
-        let isIncluded = viewModel.includedRowIDs.contains(row.id)
-
-        return HStack(spacing: 0) {
-            Text(row.typeDisplay)
-                .frame(width: Layout.typeWidth, alignment: .leading)
-
-            Text(row.sourceName ?? "")
-                .frame(width: Layout.nameWidth, alignment: .leading)
-                .lineLimit(1)
-                .truncationMode(.middle)
-
-            Button {
-                viewModel.toggleInclusion(row)
-            } label: {
-                Image(systemName: isIncluded ? "checkmark.square.fill" : "square")
-                    .foregroundStyle(isIncluded ? Color.accentColor : Color.secondary)
-                    .frame(width: Layout.checkWidth)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            Text(row.kind.actionTitle)
-                .foregroundStyle(row.kind.tint)
-                .frame(width: Layout.actionWidth, alignment: .leading)
-
-            Text(row.targetName ?? "")
-                .frame(width: Layout.nameWidth, alignment: .leading)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-        .font(.system(size: 12))
-        .padding(.vertical, 6)
-        .padding(.horizontal, 10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isSelected ? Color.accentColor.opacity(0.16) : Color.clear)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            viewModel.select(row: row, source: source, target: target)
-        }
+        .background(DomtaTheme.surface(colorScheme))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(DomtaTheme.rule(colorScheme), lineWidth: 1).allowsHitTesting(false) }
     }
 
     // MARK: - Comparison details
 
     private var detailsPane: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Comparison Details")
-                    .font(.headline)
-
-                if let row = viewModel.selectedRow {
-                    Text(row.plainName)
-                        .font(.system(.subheadline, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Comparison Details").font(.system(size: 15, weight: .semibold))
+                    if let row = viewModel.selectedRow {
+                        Text(row.plainName).font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(muted).lineLimit(1).truncationMode(.middle).help(row.plainName)
+                    }
                 }
-
+                if let row = viewModel.selectedRow { SchemaActionBadge(kind: row.kind) }
                 Spacer()
-
-                Picker("View", selection: $viewModel.diffViewMode) {
-                    ForEach(SchemaDiffViewMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
+                Picker("Definition layout", selection: $viewModel.diffViewMode) {
+                    ForEach(SchemaDiffViewMode.allCases) { mode in Text(mode.title).tag(mode) }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 190)
+                .pickerStyle(.segmented).labelsHidden().frame(width: 210)
+                .disabled(viewModel.selectedRow == nil)
             }
-
             if let row = viewModel.selectedRow, !row.memberSummaryLines.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(row.memberSummaryLines, id: \.self) { line in
-                        Text(line)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color.primary.opacity(0.04))
-                }
+                DisclosureGroup("Related changes (\(row.members.count))", isExpanded: $showsMemberDetails) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 5) {
+                            ForEach(row.memberSummaryLines, id: \.self) { line in
+                                Text(line).font(.system(size: 12)).textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }.padding(.top, 6)
+                    }.frame(maxHeight: 84)
+                }.font(.system(size: 12)).foregroundStyle(muted)
             }
-
             definitionContent
         }
-        .padding(12)
+        .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color(nsColor: .windowBackgroundColor))
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-        }
+        .background(DomtaTheme.surface(colorScheme))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(DomtaTheme.rule(colorScheme), lineWidth: 1).allowsHitTesting(false) }
     }
 
     @ViewBuilder
     private var definitionContent: some View {
-        switch viewModel.definitionState {
-        case .idle:
+        if viewModel.selectedRow == nil {
             centeredHint("เลือกแถวด้านบนเพื่อดู definition ของทั้งสองฝั่ง")
+        } else {
+            switch viewModel.definitionState {
+            case .idle:
+                centeredHint("เลือกแถวด้านบนเพื่อดู definition ของทั้งสองฝั่ง")
 
-        case .loading:
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text(usesDacpacDefinitions
-                     ? "กำลังให้ DacFx อ่าน definition จาก dacpac ทั้งสองฝั่ง (ครั้งแรกใช้เวลาสักครู่)..."
-                     : "กำลังอ่าน definition จากทั้งสองฝั่ง...")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+            case .loading:
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(usesDacpacDefinitions
+                         ? "กำลังให้ DacFx อ่าน definition จาก dacpac ทั้งสองฝั่ง (ครั้งแรกใช้เวลาสักครู่)..."
+                         : "กำลังอ่าน definition จากทั้งสองฝั่ง...")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            case .unsupported(let message):
+                centeredHint(message)
+
+            case .failed(let message):
+                ScrollView {
+                    Text(message)
+                        .font(.callout)
+                        .foregroundStyle(DomtaTheme.target(colorScheme))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+            case .loaded(let definition):
+                definitionDiff(definition)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-
-        case .unsupported(let message):
-            centeredHint(message)
-
-        case .failed(let message):
-            ScrollView {
-                Text(message)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-        case .loaded(let definition):
-            definitionDiff(definition)
         }
     }
 
@@ -564,170 +566,175 @@ struct SchemaCompareView: View {
         Text(text)
             .font(.subheadline)
             .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
     private func definitionDiff(_ definition: SchemaObjectDefinition) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 16) {
+                Label("+ Source · เพิ่มเข้า Target", systemImage: "plus.square.fill")
+                    .foregroundStyle(DomtaTheme.source(colorScheme))
+                Label("− Target · นำออกจาก Target", systemImage: "minus.square.fill")
+                    .foregroundStyle(DomtaTheme.target(colorScheme))
+                Spacer()
+                Text("\(definition.changedLineCount) changed lines").foregroundStyle(muted)
+            }.font(.system(size: 11, weight: .medium))
             if definition.isTruncated {
-                Text("definition ยาวเกินกว่าที่จะจับคู่บรรทัดได้ — แสดงเป็นสองฝั่งเต็ม ๆ แทน")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .padding(.bottom, 6)
+                Text("Definition ยาวมาก จึงแสดงบรรทัดเต็มโดยไม่จับคู่ส่วนที่ต่างกัน")
+                    .font(.system(size: 12)).foregroundStyle(muted)
             }
-
-            ScrollView([.horizontal, .vertical]) {
-                LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
-                    switch viewModel.diffViewMode {
-                    case .sideBySide:
+            GeometryReader { geometry in
+                let columnWidth = max((geometry.size.width - 2) / 2, definitionColumnWidth(definition))
+                ScrollView([.horizontal, .vertical]) {
+                    LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
                         Section {
-                            ForEach(definition.sideBySideRows) { row in
-                                SchemaSideBySideRowView(row: row)
-                                    .equatable()
+                            switch viewModel.diffViewMode {
+                            case .sideBySide:
+                                ForEach(definition.sideBySideRows) { row in
+                                    SchemaSideBySideRowView(row: row, columnWidth: columnWidth)
+                                        .equatable()
+                                }
+                            case .unified:
+                                ForEach(definition.lines) { line in
+                                    SchemaDiffLineView(line: line, width: max(geometry.size.width, columnWidth + 52))
+                                        .equatable()
+                                }
                             }
                         } header: {
-                            sideBySideHeader
-                        }
-
-                    case .unified:
-                        ForEach(definition.lines) { line in
-                            SchemaDiffLineView(line: line)
-                                .equatable()
+                            if viewModel.diffViewMode == .sideBySide {
+                                HStack(spacing: 1) {
+                                    definitionHeader("Source", label: definition.sourceText == nil ? "ไม่มี object นี้" : sourceLabel, color: DomtaTheme.source(colorScheme), width: columnWidth)
+                                    definitionHeader("Target", label: definition.targetText == nil ? "ไม่มี object นี้" : targetLabel, color: DomtaTheme.target(colorScheme), width: columnWidth)
+                                }
+                            } else {
+                                HStack(spacing: 0) {
+                                    Text("Src").frame(width: 44)
+                                    Text("Tgt").frame(width: 44)
+                                    Text("Definition · + เพิ่ม / − นำออกจาก Target").padding(.leading, 22)
+                                    Spacer()
+                                }
+                                .font(.system(size: 11, weight: .medium)).foregroundStyle(muted)
+                                .frame(width: max(geometry.size.width, columnWidth + 52), height: 32)
+                                .background(DomtaTheme.canvas(colorScheme))
+                            }
                         }
                     }
+                    .textSelection(.enabled)
                 }
-                .padding(.bottom, 4)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(Color(nsColor: .textBackgroundColor))
+                .background(DomtaTheme.canvas(colorScheme))
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .id("\(viewModel.selectedRowID ?? "")-\(viewModel.diffViewMode.rawValue)")
             }
         }
     }
 
-    private var sideBySideHeader: some View {
-        HStack(spacing: 0) {
-            Text("")
-                .frame(width: SchemaSideBySideRowView.gutterWidth)
-            Text(sourceLabel)
-                .foregroundStyle(.green)
-                .frame(width: SchemaSideBySideRowView.columnWidth, alignment: .leading)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Text("")
-                .frame(width: SchemaSideBySideRowView.gutterWidth)
-            Text(targetLabel)
-                .foregroundStyle(.red)
-                .frame(width: SchemaSideBySideRowView.columnWidth, alignment: .leading)
-                .lineLimit(1)
-                .truncationMode(.middle)
+    /// Keep both halves equally wide and prevent SQL wrapping from misaligning paired rows.
+    private func definitionColumnWidth(_ definition: SchemaObjectDefinition) -> CGFloat {
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let widest = definition.lines.map { ($0.text as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+        return max(380, ceil(widest) + 76)
+    }
+
+    private func definitionHeader(_ title: String, label: String, color: Color, width: CGFloat) -> some View {
+        HStack(spacing: 8) {
+            Text(title).foregroundStyle(color)
+            Text(label).foregroundStyle(muted).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 0)
         }
-        .font(.caption.weight(.semibold))
-        .padding(.vertical, 5)
-        .padding(.horizontal, 4)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color.primary.opacity(0.10))
-                .frame(height: 0.5)
-        }
+        .font(.system(size: 11, weight: .semibold))
+        .padding(.horizontal, 12)
+        .frame(width: width, height: 32)
+        .background(DomtaTheme.canvas(colorScheme))
     }
 }
 
-/// หนึ่งบรรทัดของมุมมองเทียบสองฝั่ง — เลขบรรทัดกับเครื่องหมาย +/- อยู่ติดกันแบบ mssql extension
-private struct SchemaSideBySideRowView: View, Equatable {
-    static let columnWidth: CGFloat = 460
-    static let gutterWidth: CGFloat = 52
+private struct SchemaActionBadge: View {
+    let kind: SchemaChangeKind
+    @Environment(\.colorScheme) private var colorScheme
 
-    let row: SchemaSideBySideRow
-
-    static func == (lhs: SchemaSideBySideRowView, rhs: SchemaSideBySideRowView) -> Bool {
-        lhs.row == rhs.row
+    private var tint: Color {
+        switch kind {
+        case .create: DomtaTheme.source(colorScheme)
+        case .drop, .recreate: DomtaTheme.target(colorScheme)
+        default: DomtaTheme.accent(colorScheme)
+        }
     }
 
     var body: some View {
-        HStack(spacing: 0) {
-            gutter(number: row.sourceNumber, marker: sourceMarker)
-            textCell(row.sourceText, background: row.kind.sourceBackground, isMissing: row.sourceText == nil)
-            gutter(number: row.targetNumber, marker: targetMarker)
-            textCell(row.targetText, background: row.kind.targetBackground, isMissing: row.targetText == nil)
-        }
-        .font(.system(size: 11, design: .monospaced))
-        .padding(.horizontal, 4)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var sourceMarker: String {
-        switch row.kind {
-        case .changed, .sourceOnly: return "+"
-        case .unchanged, .targetOnly: return " "
-        }
-    }
-
-    private var targetMarker: String {
-        switch row.kind {
-        case .changed, .targetOnly: return "-"
-        case .unchanged, .sourceOnly: return " "
-        }
-    }
-
-    private func gutter(number: Int?, marker: String) -> some View {
-        HStack(spacing: 2) {
-            Text(number.map(String.init) ?? "")
-                .foregroundStyle(.tertiary)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-            Text(marker)
-                .foregroundStyle(.secondary)
-                .frame(width: 8, alignment: .leading)
-        }
-        .frame(width: SchemaSideBySideRowView.gutterWidth)
-        .padding(.vertical, 1)
-    }
-
-    private func textCell(_ text: String?, background: Color, isMissing: Bool) -> some View {
-        Group {
-            if let text {
-                Text(SQLSyntaxHighlighter.highlight(text))
-            } else {
-                Text("")
-            }
-        }
-        .frame(width: SchemaSideBySideRowView.columnWidth, alignment: .leading)
-        .padding(.leading, 6)
-        .padding(.vertical, 1)
-        .background(isMissing ? Color.primary.opacity(0.05) : background)
+        Label(kind.actionTitle, systemImage: kind.systemImage)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            .background(DomtaTheme.surface(colorScheme), in: RoundedRectangle(cornerRadius: 4))
+            .overlay { RoundedRectangle(cornerRadius: 4).strokeBorder(tint.opacity(0.35), lineWidth: 1) }
     }
 }
 
-/// หนึ่งบรรทัดของ unified diff
+private struct SchemaSideBySideRowView: View, Equatable {
+    let row: SchemaSideBySideRow
+    let columnWidth: CGFloat
+    @Environment(\.colorScheme) private var colorScheme
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.row == rhs.row && lhs.columnWidth == rhs.columnWidth }
+
+    var body: some View {
+        HStack(spacing: 1) {
+            cell(row.sourceText, number: row.sourceNumber,
+                 marker: row.kind == .changed || row.kind == .sourceOnly ? "+" : " ",
+                 tint: DomtaTheme.source(colorScheme))
+            cell(row.targetText, number: row.targetNumber,
+                 marker: row.kind == .changed || row.kind == .targetOnly ? "−" : " ",
+                 tint: DomtaTheme.target(colorScheme))
+        }
+        .background(DomtaTheme.rule(colorScheme))
+    }
+
+    private func cell(_ text: String?, number: Int?, marker: String, tint: Color) -> some View {
+        HStack(spacing: 0) {
+            Text(number.map(String.init) ?? "")
+                .foregroundStyle(DomtaTheme.placeholder(colorScheme))
+                .frame(width: 36, alignment: .trailing)
+            Text(marker).foregroundStyle(tint).frame(width: 24)
+            Text(SQLSyntaxHighlighter.highlight(text ?? "", colorScheme: colorScheme))
+                .lineLimit(1).fixedSize(horizontal: true, vertical: false)
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 12, design: .monospaced))
+        .frame(width: columnWidth, height: 23, alignment: .leading)
+        .background(marker == " " ? Color.clear : tint.opacity(colorScheme == .dark ? 0.12 : 0.07))
+        .background(text == nil ? DomtaTheme.rule(colorScheme).opacity(0.18) : DomtaTheme.canvas(colorScheme))
+    }
+}
+
 private struct SchemaDiffLineView: View, Equatable {
     let line: SchemaDiffLine
+    let width: CGFloat
+    @Environment(\.colorScheme) private var colorScheme
 
-    static func == (lhs: SchemaDiffLineView, rhs: SchemaDiffLineView) -> Bool {
-        lhs.line == rhs.line
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.line == rhs.line && lhs.width == rhs.width }
+
+    private var tint: Color {
+        switch line.kind {
+        case .sourceOnly: DomtaTheme.source(colorScheme)
+        case .targetOnly: DomtaTheme.target(colorScheme)
+        case .unchanged: DomtaTheme.placeholder(colorScheme)
+        }
     }
 
     var body: some View {
         HStack(spacing: 0) {
             Text(line.sourceNumber.map(String.init) ?? "")
-                .frame(width: 44, alignment: .trailing)
-                .foregroundStyle(.tertiary)
+                .frame(width: 44, alignment: .trailing).foregroundStyle(DomtaTheme.placeholder(colorScheme))
             Text(line.targetNumber.map(String.init) ?? "")
-                .frame(width: 44, alignment: .trailing)
-                .foregroundStyle(.tertiary)
-            Text(line.kind.gutterSymbol)
-                .frame(width: 20, alignment: .center)
-                .foregroundStyle(.secondary)
-            Text(SQLSyntaxHighlighter.highlight(line.text))
-                .frame(minWidth: 480, alignment: .leading)
+                .frame(width: 44, alignment: .trailing).foregroundStyle(DomtaTheme.placeholder(colorScheme))
+            Text(line.kind.gutterSymbol).frame(width: 24).foregroundStyle(tint)
+            Text(SQLSyntaxHighlighter.highlight(line.text, colorScheme: colorScheme))
+                .lineLimit(1).fixedSize(horizontal: true, vertical: false)
+            Spacer(minLength: 0)
         }
-        .font(.system(size: 11, design: .monospaced))
-        .padding(.vertical, 1)
-        .padding(.horizontal, 6)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(line.kind.backgroundColor)
+        .font(.system(size: 12, design: .monospaced))
+        .frame(width: width, height: 23, alignment: .leading)
+        .background(line.kind == .unchanged ? Color.clear : tint.opacity(colorScheme == .dark ? 0.12 : 0.07))
     }
 }
 

@@ -43,22 +43,37 @@ enum SQLSyntaxHighlighter {
         case number
         case comment
 
-        var color: Color {
+        func color(for scheme: ColorScheme) -> Color {
+            if scheme == .light {
+                switch self {
+                case .plain, .identifier: return DomtaTheme.graphite
+                case .keyword, .type: return Color(red: 0.07, green: 0.30, blue: 0.43)
+                case .string: return Color(red: 0.48, green: 0.22, blue: 0.07)
+                case .number: return Color(red: 0.43, green: 0.20, blue: 0.47)
+                case .comment: return Color(red: 0.24, green: 0.35, blue: 0.24)
+                }
+            }
             switch self {
             case .plain: return .primary
-            case .keyword: return Color(red: 0.35, green: 0.63, blue: 0.90)
+            case .keyword: return Color(red: 0.48, green: 0.72, blue: 0.98)
             case .type: return Color(red: 0.30, green: 0.75, blue: 0.78)
             case .identifier: return Color(red: 0.60, green: 0.78, blue: 0.98)
             case .string: return Color(red: 0.85, green: 0.60, blue: 0.42)
-            case .number: return Color(red: 0.80, green: 0.45, blue: 0.80)
-            case .comment: return Color(red: 0.45, green: 0.62, blue: 0.45)
+            case .number: return Color(red: 0.88, green: 0.61, blue: 0.90)
+            case .comment: return Color(red: 0.59, green: 0.72, blue: 0.56)
             }
         }
     }
 
-    static func highlight(_ line: String) -> AttributedString {
+    static func highlight(_ line: String, colorScheme: ColorScheme) -> AttributedString {
         guard !line.isEmpty, line.count <= maximumLineLength else {
             return AttributedString(line)
+        }
+
+        func styled(_ text: String, _ style: TokenStyle) -> AttributedString {
+            var piece = AttributedString(text)
+            piece.foregroundColor = style.color(for: colorScheme)
+            return piece
         }
 
         var result = AttributedString()
@@ -127,9 +142,4 @@ enum SQLSyntaxHighlighter {
         return result
     }
 
-    private static func styled(_ text: String, _ style: TokenStyle) -> AttributedString {
-        var piece = AttributedString(text)
-        piece.foregroundColor = style.color
-        return piece
-    }
 }

@@ -94,6 +94,53 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
         return isCancelled
     }
 
+    // MARK: - Standalone schema export
+
+    /// Use a fresh service per export so cancellation also works before the worker starts.
+    /// Stage beside the destination; a failed/cancelled extraction never replaces an existing file.
+    func exportDacpac(input: ConnectionInput, to destination: URL,
+                      progress: (@Sendable (String) -> Void)? = nil) throws {
+        let configuration = try ConnectionStringParser.validatedConfiguration(from: input)
+        guard let database = configuration.database, !database.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CompareAppError.invalidConnectionString("ระบุ Database หรือ Initial Catalog ก่อน export DACPAC")
+        }
+        guard resolvedSqlPackageURL() != nil else { throw CompareAppError.sqlPackageNotFound }
+        if cancellationRequested { throw CompareAppError.operationCancelled }
+
+        let files = FileManager.default
+        let stagingDirectory = try files.url(for: .itemReplacementDirectory, in: .userDomainMask,
+                                             appropriateFor: destination, create: true)
+        defer { try? files.removeItem(at: stagingDirectory) }
+        let stagedFile = stagingDirectory.appendingPathComponent("schema.dacpac")
+        try runSqlPackage(arguments: Self.schemaExportArguments(configuration: configuration, outputURL: stagedFile),
+                          configuration: configuration, stage: "Export DACPAC", progress: progress)
+        if cancellationRequested { throw CompareAppError.operationCancelled }
+        let attributes = try files.attributesOfItem(atPath: stagedFile.path)
+        guard (attributes[.size] as? NSNumber)?.int64Value ?? 0 > 0 else {
+            throw CompareAppError.sqlPackageFailed("sqlpackage ไม่ได้สร้างไฟล์ DACPAC ที่สมบูรณ์")
+        }
+        if files.fileExists(atPath: destination.path) {
+            _ = try files.replaceItemAt(destination, withItemAt: stagedFile)
+        } else {
+            try files.moveItem(at: stagedFile, to: destination)
+        }
+    }
+
+    static func schemaExportArguments(configuration: SQLConnectionConfiguration, outputURL: URL) -> [String] {
+        [
+            "/Action:Extract",
+            "/SourceConnectionString:\(connectionString(for: configuration))",
+            "/TargetFile:\(outputURL.path)",
+            "/p:ExtractTarget=DacPac",
+            "/p:ExtractAllTableData=False",
+            "/p:ExtractUsageProperties=False",
+            "/p:VerifyExtraction=True",
+            "/p:IgnorePermissions=False",
+            "/p:IgnoreUserLoginMappings=False",
+            "/p:IgnoreExtendedProperties=False"
+        ]
+    }
+
     // MARK: - Compare
 
     nonisolated func compareSchema(
@@ -404,14 +451,17 @@ nonisolated final class SqlPackageService: @unchecked Sendable {
             collector.appendStandardError(handle.availableData)
         }
 
+        // Serialize starting with cancel(): cancellation must not miss a not-yet-running process.
         processLock.lock()
-        runningProcess = process
-        processLock.unlock()
-
+        guard !isCancelled else {
+            processLock.unlock()
+            throw CompareAppError.operationCancelled
+        }
         do {
             try process.run()
+            runningProcess = process
+            processLock.unlock()
         } catch {
-            processLock.lock()
             runningProcess = nil
             processLock.unlock()
             throw CompareAppError.sqlPackageFailed("เรียก sqlpackage ไม่สำเร็จ: \(error.localizedDescription)")
